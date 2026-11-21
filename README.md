@@ -170,3 +170,7 @@ Cloudflare API stand in for Let's Encrypt and Cloudflare, and
 registers, keeps the control WebSocket open and splices streams to a local
 TLS server. The tests reach the control API over TLS on the public port with
 SNI `relay.akdbx.link`, using a test CA.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
