@@ -1,27 +1,26 @@
-# Caddy site for the akdbx relay's control API and landing page.
+# Caddy site for the akdbx relay's static landing page.
 #
-# akdbx.link is proxied by Cloudflare (orange cloud). The broker hostnames
-# (*.akdbx.link) are DNS only and go straight to the relay on port 8443;
+# akdbx.link is proxied by Cloudflare (orange cloud) and serves only this
+# page. The relay's control API is NOT here: brokers use
+# https://relay.akdbx.link:8443, a DNS-only name that the relay terminates
+# itself, so no bearer secret passes through Cloudflare or Caddy. The broker
+# names (*.akdbx.link, DNS only) also go straight to the relay on port 8443;
 # Caddy never sees them.
 #
 # Append this block to the Caddyfile (back it up first), set the bind
 # address to the host's public IPv4 like the other site blocks, validate,
-# then reload. See deploy/DEPLOY.md.
+# then reload. Replace any earlier version of this block that proxied
+# /api/* to the relay. See deploy/DEPLOY.md.
 
 akdbx.link {
 	# bind <public IPv4 of the relay host>
 
-	# Control API: register, certificate, and the WebSocket channels.
-	# Caddy's reverse_proxy passes WebSocket upgrades through. The relay reads
-	# Cloudflare's CF-Connecting-IP header only because the TCP peer is
-	# 127.0.0.1 (this proxy) and ports 80/443 accept only Cloudflare.
+	# Nothing under /api/ is served here. Answer 404 rather than a file
+	# lookup, so old clients fail clearly.
 	handle /api/* {
-		reverse_proxy 127.0.0.1:8771 {
-			flush_interval -1
-		}
+		respond "Not found. The akdbx relay API is at https://relay.akdbx.link:8443/api/v1/" 404
 	}
 
-	# Small static landing page.
 	handle {
 		root * /var/www/akdbx.link
 		file_server

@@ -1,7 +1,9 @@
 """A small HTTP/1.1 server for the control API (one request per connection).
 
-It runs on 127.0.0.1 behind Caddy. It parses only what the API needs and
-enforces size and time limits on the request head and body.
+The relay serves it inside its own TLS (for the control host name on the
+public port) and, for the health check only, on a loopback plain-HTTP port.
+It parses only what the API needs and enforces size and time limits on the
+request head and body.
 """
 
 from __future__ import annotations
@@ -137,7 +139,7 @@ def _parse_head(raw: bytes) -> tuple[str, str, str, dict[str, str]]:
         key = name.lower()
         value = value.strip()
         if key in headers:
-            if key in ("content-length", "authorization", "host", "transfer-encoding", "cf-connecting-ip"):
+            if key in ("content-length", "authorization", "host", "transfer-encoding"):
                 raise HTTPError(400, "bad_request", "duplicate header")
             headers[key] = headers[key] + ", " + value
         else:
@@ -187,9 +189,13 @@ class HTTPServer:
     def __init__(self, router: Callable[[str, str], tuple[Handler, int] | None]) -> None:
         self.router = router
 
-    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        peername = writer.get_extra_info("peername")
-        peer = peername[0] if peername else ""
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                     peer: str | None = None) -> None:
+        """Serve one request. `peer` is the client's address when the TCP
+        connection's own peer is not the client (the relay's TLS bridge)."""
+        if peer is None:
+            peername = writer.get_extra_info("peername")
+            peer = str(peername[0]) if peername else ""
         took_over = False
         try:
             try:
@@ -233,7 +239,11 @@ class HTTPServer:
             if not took_over:
                 with contextlib.suppress(Exception):
                     writer.close()
+                try:
                     await asyncio.wait_for(writer.wait_closed(), 2)
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        writer.transport.abort()
 
     @staticmethod
     async def _send(writer: asyncio.StreamWriter, response: Response, head_only: bool = False) -> None:

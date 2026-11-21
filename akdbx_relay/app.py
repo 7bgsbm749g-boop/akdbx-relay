@@ -12,6 +12,7 @@ import sys
 from . import __version__
 from .cloudflare import CloudflareDNS
 from .config import Config, ConfigError
+from .controltls import ControlTLSError
 from .issuer import ACMEIssuer
 from .relay import Relay
 from .store import Store
@@ -84,9 +85,16 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
     if args.check_config:
-        print(f"configuration OK; certificate issuance {'on' if cfg.issuance_configured else 'off'}")
+        tls = ("operator files" if not cfg.managed_control_tls
+               else "relay-managed (ACME)" if cfg.issuance_configured else "relay-managed, but issuance is off")
+        print(f"configuration OK; certificate issuance {'on' if cfg.issuance_configured else 'off'}; "
+              f"control API https://{cfg.control_hostname}:{cfg.advertised_port} ({tls})")
         return 0
-    asyncio.run(serve(cfg))
+    try:
+        asyncio.run(serve(cfg))
+    except ControlTLSError as exc:
+        print(f"akdbx-relay: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 

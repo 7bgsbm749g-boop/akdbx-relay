@@ -220,3 +220,35 @@ async def test_read_client_hello_too_large():
     with pytest.raises(ClientHelloError):
         await read_client_hello(feed.reader, max_bytes=1024)
     await task
+
+
+# R6: record cap and incremental parsing
+
+
+def test_more_than_eight_records_refused():
+    hello = client_hello(NAME)
+    assert parse_client_hello(split_records(hello, [1] * 7)) == NAME  # 8 records
+    with pytest.raises(ClientHelloError):
+        parse_client_hello(split_records(hello, [1] * 8))  # 9 records
+
+
+def test_incremental_parser_one_byte_at_a_time():
+    from akdbx_relay.tlspeek import ClientHelloParser
+
+    hello = split_records(client_hello(NAME), [7, 50])
+    parser = ClientHelloParser()
+    results = [parser.feed(hello[i : i + 1]) for i in range(len(hello))]
+    assert results[-1] is True and not any(results[:-1])
+    assert parser.sni == NAME and parser.records == 3
+
+
+async def test_read_client_hello_refuses_tiny_records_early():
+    # 1-byte records: the reader stops at the ninth record header instead of
+    # buffering (and reparsing) up to the size limit.
+    hello = client_hello(NAME)
+    data = split_records(hello, [1] * 200)
+    feed = FeedReader([data[i : i + 6] for i in range(0, len(data), 6)], eof=False)
+    task = asyncio.create_task(feed.run())
+    with pytest.raises(ClientHelloError):
+        await read_client_hello(feed.reader)
+    await task

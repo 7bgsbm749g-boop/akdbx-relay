@@ -15,7 +15,8 @@ Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=15s
 
-# State (SQLite and the ACME account key) in /var/lib/akdbx-relay, mode 0700.
+# State (SQLite, the ACME account key, and the control TLS key and
+# certificate for relay.akdbx.link) in /var/lib/akdbx-relay, mode 0700.
 StateDirectory=akdbx-relay
 StateDirectoryMode=0700
 UMask=0077

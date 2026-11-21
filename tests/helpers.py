@@ -124,10 +124,14 @@ def client_hello(server_name: str | None, *, tls13: bool = True) -> bytes:
 
 async def http(port: int, method: str, path: str, body: object = None,
                headers: dict[str, str] | None = None, raw_body: bytes | None = None,
-               host: str = "127.0.0.1") -> tuple[int, dict[str, str], object]:
-    reader, writer = await asyncio.open_connection(host, port)
+               host: str = "127.0.0.1", ssl_ctx: ssl.SSLContext | None = None,
+               server_hostname: str | None = None) -> tuple[int, dict[str, str], object]:
+    if ssl_ctx is not None:
+        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_ctx, server_hostname=server_hostname)
+    else:
+        reader, writer = await asyncio.open_connection(host, port)
     data = raw_body if raw_body is not None else (json.dumps(body).encode() if body is not None else b"")
-    lines = [f"{method} {path} HTTP/1.1", "Host: akdbx.link"]
+    lines = [f"{method} {path} HTTP/1.1", f"Host: {server_hostname or 'akdbx.link'}"]
     for k, v in (headers or {}).items():
         lines.append(f"{k}: {v}")
     if method == "POST" and not any(k.lower() in ("content-length", "transfer-encoding") for k in (headers or {})):
@@ -150,13 +154,36 @@ async def http(port: int, method: str, path: str, body: object = None,
     return status, hdrs, parsed
 
 
-def make_config(tmp_path, **overrides) -> Config:
+CONTROL_HOSTNAME = "relay.akdbx.link"
+# Test CA for the relay's control certificate (operator-supplied files in tests).
+CONTROL_CA = CA()
+
+
+def control_client_context() -> ssl.SSLContext:
+    return CONTROL_CA.client_context()
+
+
+def write_control_cert(tmp_path, name: str = CONTROL_HOSTNAME) -> tuple[str, str]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    chain, key = CONTROL_CA.leaf(name)
+    cert_file, key_file = tmp_path / "operator-control-chain.pem", tmp_path / "operator-control-key.pem"
+    cert_file.write_bytes(chain)
+    key_file.write_bytes(key)
+    return str(cert_file), str(key_file)
+
+
+def make_config(tmp_path, managed_tls: bool = False, **overrides) -> Config:
+    cert_file = key_file = ""
+    if not managed_tls:
+        cert_file, key_file = write_control_cert(tmp_path)
     cfg = Config(
         domain="akdbx.link",
         public_hosts=["127.0.0.1"],
         public_port=0,
-        control_host="127.0.0.1",
-        control_port=0,
+        health_host="127.0.0.1",
+        health_port=0,
+        control_cert_file=cert_file,
+        control_key_file=key_file,
         state_path=str(tmp_path / "relay.sqlite3"),
         acme_account_key_file=str(tmp_path / "acme-account.pem"),
         dns_propagation_seconds=0,
@@ -164,7 +191,26 @@ def make_config(tmp_path, **overrides) -> Config:
     )
     for k, v in overrides.items():
         setattr(cfg, k, v)
+    cfg.validate()
     return cfg
+
+
+def relay_url(relay: Relay) -> str:
+    """The control API base URL; tests reach it through 127.0.0.1 (see CLIENT_KW)."""
+    return f"https://{relay.cfg.control_hostname}:{relay.public_port}"
+
+
+def client_kw() -> dict:
+    """Keyword arguments for akdbx_relay.testclient: dial 127.0.0.1, trust the test CA."""
+    return {"ssl_context": control_client_context(), "connect_host": "127.0.0.1"}
+
+
+async def api(relay: Relay, method: str, path: str, body: object = None,
+              headers: dict[str, str] | None = None,
+              raw_body: bytes | None = None) -> tuple[int, dict[str, str], object]:
+    """One control API request over TLS to the public port (SNI = control host name)."""
+    return await http(relay.public_port, method, path, body, headers, raw_body,
+                      ssl_ctx=control_client_context(), server_hostname=relay.cfg.control_hostname)
 
 
 class FakeIssuer:
@@ -173,22 +219,25 @@ class FakeIssuer:
     def __init__(self, ca: CA | None = None) -> None:
         self.ca = ca or CA()
         self.calls: list[str] = []
+        self.deadlines: list[float | None] = []
         self.fail: Exception | None = None
+        self.days = 90
 
-    async def issue(self, name: str, csr_pem_bytes: bytes) -> str:
+    async def issue(self, name: str, csr_pem_bytes: bytes, deadline: float | None = None) -> str:
         self.calls.append(name)
+        self.deadlines.append(deadline)
         if self.fail is not None:
             raise self.fail
         csr = x509.load_pem_x509_csr(csr_pem_bytes)
-        cert = self.ca.sign_csr(csr)
+        cert = self.ca.sign_csr(csr, self.days)
         return (cert.public_bytes(serialization.Encoding.PEM) + self.ca.pem).decode()
 
     async def cleanup_stale_records(self) -> None:
         return None
 
 
-async def start_relay(tmp_path, issuer=None, **overrides) -> Relay:
-    cfg = make_config(tmp_path, **overrides)
+async def start_relay(tmp_path, issuer=None, managed_tls: bool = False, **overrides) -> Relay:
+    cfg = make_config(tmp_path, managed_tls, **overrides)
     relay = Relay(cfg, Store(cfg.state_path), issuer)
     await relay.start()
     return relay

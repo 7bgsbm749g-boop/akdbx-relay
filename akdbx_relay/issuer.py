@@ -21,12 +21,20 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from . import __version__
 from .cloudflare import CloudflareDNS
 from .config import Config
-from .store import Store
+from .store import Store, TxtMarker
 
 log = logging.getLogger("akdbx_relay.issuer")
 # The acme library logs JWS payloads (CSRs) and responses at DEBUG.
 logging.getLogger("acme").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+# Tag on every TXT record the relay creates, so start-up can find its own.
+RECORD_COMMENT = "akdbx-relay ACME challenge"
+# A relay-owned TXT record older than this many certificate deadlines
+# cannot belong to an order that is still running.
+STALE_RECORD_AGE_FACTOR = 2
+# Shortest time an order needs after the DNS wait (validation, finalization).
+MIN_VALIDATION_SECONDS = 5.0
 
 
 class IssuanceError(Exception):
@@ -90,13 +98,13 @@ class ACMEIssuer:
             self._key = jose.JWKRSA(key=load_or_create_account_key(self.cfg.acme_account_key_file))
         return self._key
 
-    def _new_client(self, account_uri: str | None) -> client.ClientV2:
+    def _new_client(self, account_uri: str | None, timeout: float = 30.0) -> client.ClientV2:
         verify: object = self.cfg.acme_ca_bundle or True
         net = client.ClientNetwork(
             self._jwk(),
             user_agent=f"akdbx-relay/{__version__}",
             verify_ssl=verify,  # type: ignore[arg-type]  # requests accepts a CA bundle path
-            timeout=30,
+            timeout=max(1, min(30, int(timeout))),
         )
         directory = client.ClientV2.get_directory(self.cfg.acme_directory, net)
         acme = client.ClientV2(directory, net)
@@ -127,18 +135,61 @@ class ACMEIssuer:
             return uri
 
     async def cleanup_stale_records(self) -> None:
-        """Remove TXT records left behind by a crash during an earlier order."""
-        for record_id in self.store.txt_records():
+        """Remove TXT records left behind by a crash or a cancelled order.
+
+        Two passes: every cleanup marker in the store (a marker is written
+        before the record is created, so a record whose creation was cut off
+        is still found by name and value), then every relay-owned
+        ``_acme-challenge`` record in the zone that is older than any order
+        could be. At start-up no order of this relay is running.
+        """
+        for marker in self.store.txt_markers():
             try:
-                await self.dns.delete_txt(record_id)
-                self.store.remove_txt_record(record_id)
+                await self._remove_marked(marker)
+            except Exception as exc:
+                log.warning("could not remove a stale ACME TXT record: %s", exc)
+        try:
+            records = await self.dns.list_txt()
+        except Exception as exc:
+            log.warning("could not list ACME TXT records: %s", exc)
+            return
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+            seconds=STALE_RECORD_AGE_FACTOR * self.cfg.certificate_deadline)
+        suffix = "." + self.cfg.domain
+        for rec in records:
+            name = rec.name.lower().rstrip(".")
+            if (rec.comment != RECORD_COMMENT or not name.startswith("_acme-challenge.")
+                    or not (name.endswith(suffix) or name == "_acme-challenge" + suffix)):
+                continue
+            if rec.created is not None and rec.created > cutoff:
+                continue  # possibly an order of another relay process that is still running
+            try:
+                await self.dns.delete_txt(rec.id)
+                log.info("removed a stale relay-owned ACME TXT record")
             except Exception as exc:
                 log.warning("could not remove a stale ACME TXT record: %s", exc)
 
-    async def issue(self, name: str, csr_pem: bytes) -> str:
-        """Run one ACME order for `name`. Returns the PEM chain, leaf first."""
+    async def _remove_marked(self, marker: TxtMarker) -> None:
+        """Delete the record a marker describes, then the marker."""
+        if marker.record_id:
+            await self.dns.delete_txt(marker.record_id)
+        elif marker.name:
+            # The create call may or may not have reached Cloudflare.
+            for rec in await self.dns.list_txt(marker.name):
+                if rec.content.strip('"') == marker.content and rec.comment == RECORD_COMMENT:
+                    await self.dns.delete_txt(rec.id)
+        self.store.remove_txt_marker(marker.id)
+
+    async def issue(self, name: str, csr_pem: bytes, deadline: float | None = None) -> str:
+        """Run one ACME order for `name`. Returns the PEM chain, leaf first.
+
+        `deadline` is an event-loop time; the order gives up when it passes.
+        """
+        loop = asyncio.get_running_loop()
+        if deadline is None:
+            deadline = loop.time() + self.cfg.certificate_deadline
         try:
-            return await self._issue(name, csr_pem)
+            return await self._issue(name, csr_pem, deadline)
         except IssuanceError:
             raise
         except messages.Error as exc:
@@ -154,12 +205,20 @@ class ACMEIssuer:
         except Exception as exc:
             raise IssuanceError(f"ACME failure: {type(exc).__name__}") from None
 
-    async def _issue(self, name: str, csr_pem: bytes) -> str:
+    async def _issue(self, name: str, csr_pem: bytes, deadline: float) -> str:
+        loop = asyncio.get_running_loop()
+
+        def remaining() -> float:
+            return deadline - loop.time()
+
+        if remaining() < self.cfg.dns_propagation_seconds + MIN_VALIDATION_SECONDS:
+            raise IssuanceError("not enough time left for an ACME order")
         uri = await self._account_uri()
-        acme = await asyncio.to_thread(self._new_client, uri)
+        acme = await asyncio.to_thread(self._new_client, uri, remaining())
         key = self._jwk()
         orderr = await asyncio.to_thread(acme.new_order, csr_pem)
-        created: list[str] = []
+        markers: list[TxtMarker] = []
+        unsure: set[int] = set()  # markers whose create call was cut off and may still run
         try:
             answers = []
             for authz in orderr.authorizations:
@@ -175,23 +234,39 @@ class ACMEIssuer:
                 if chall is None:
                     raise IssuanceError("ACME server offered no DNS-01 challenge")
                 record_name = chall.chall.validation_domain_name(identifier)
-                record_id = await self.dns.create_txt(record_name, chall.chall.validation(key))
-                created.append(record_id)
-                self.store.add_txt_record(record_id)
+                value = chall.chall.validation(key)
+                # The marker is stored before the record exists: if this task
+                # is cancelled while Cloudflare creates it, the next start
+                # still finds and removes it.
+                marker = self.store.add_txt_marker(record_name, value)
+                markers.append(marker)
+                try:
+                    record_id = await self.dns.create_txt(record_name, value, RECORD_COMMENT)
+                except asyncio.CancelledError:
+                    unsure.add(marker.id)
+                    raise
+                self.store.set_txt_marker_record(marker.id, record_id)
+                markers[-1] = TxtMarker(marker.id, record_name, value, record_id)
                 answers.append(chall)
-            if created and self.cfg.dns_propagation_seconds > 0:
+            if markers and self.cfg.dns_propagation_seconds > 0:
                 await asyncio.sleep(self.cfg.dns_propagation_seconds)
             for chall in answers:
                 await asyncio.to_thread(acme.answer_challenge, chall, chall.chall.response(key))
-            deadline = datetime.datetime.now() + datetime.timedelta(seconds=self.cfg.acme_timeout)
-            orderr = await asyncio.to_thread(acme.poll_and_finalize, orderr, deadline)
+            wait = min(self.cfg.acme_timeout, remaining())
+            if wait <= 0:
+                raise IssuanceError("the certificate request deadline passed")
+            poll_deadline = datetime.datetime.now() + datetime.timedelta(seconds=wait)
+            orderr = await asyncio.to_thread(acme.poll_and_finalize, orderr, poll_deadline)
         finally:
-            for record_id in created:
+            for marker in markers:
+                if marker.id in unsure:
+                    continue  # the next start removes it
                 try:
-                    await self.dns.delete_txt(record_id)
-                    self.store.remove_txt_record(record_id)
+                    await self._remove_marked(marker)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
-                    # The record stays in the store and is removed at the next start.
+                    # The marker stays in the store; the record is removed at the next start.
                     log.warning("could not remove an ACME TXT record: %s", exc)
         if not orderr.fullchain_pem:
             raise IssuanceError("ACME order returned no certificate")

@@ -2,6 +2,11 @@
 
 Client IPs are kept only in memory, only as long as a limit needs them, and
 are never written to disk or logs.
+
+Each table has a size cap. When a new key arrives at a full table, the table
+first drops entries that no longer limit anything, then the least recently
+used entry. A flood of addresses can therefore reset other addresses' limits
+early, but it can never lock every new address out.
 """
 
 from __future__ import annotations
@@ -31,18 +36,21 @@ class TokenBucket:
     def allow(self, key: str) -> bool:
         now = self.clock()
         self._sweep(now)
-        tokens, stamp = self._buckets.get(key, (self.burst, now))
+        entry = self._buckets.pop(key, None)  # re-inserted below: dict order is recency
+        if entry is None and len(self._buckets) >= self.max_keys:
+            self._sweep(now, force=True)
+            while len(self._buckets) >= self.max_keys:
+                del self._buckets[next(iter(self._buckets))]  # least recently used
+        tokens, stamp = entry if entry is not None else (self.burst, now)
         tokens = min(self.burst, tokens + (now - stamp) * self.rate)
         if tokens < 1.0:
             self._buckets[key] = (tokens, now)
             return False
-        if key not in self._buckets and len(self._buckets) >= self.max_keys:
-            return False
         self._buckets[key] = (tokens - 1.0, now)
         return True
 
-    def _sweep(self, now: float) -> None:
-        if now - self._last_sweep < 60:
+    def _sweep(self, now: float, force: bool = False) -> None:
+        if not force and now - self._last_sweep < 60:
             return
         self._last_sweep = now
         full_after = self.burst / self.rate
@@ -88,17 +96,25 @@ class SlidingWindow:
         self._sweep(now)
         q = self._trim(key, now)
         if q is None:
-            return 0.0 if len(self._events) < self.max_keys else self.window
+            return 0.0
         if len(q) < self.limit:
             return 0.0
         return max(1.0, self.window - (now - q[0]))
 
     def record(self, key: str) -> None:
         now = self.clock()
-        self._events.setdefault(key, deque()).append(now)
+        q = self._events.pop(key, None)  # re-inserted below: dict order is recency
+        if q is None:
+            q = deque()
+            if len(self._events) >= self.max_keys:
+                self._sweep(now, force=True)
+                while len(self._events) >= self.max_keys:
+                    del self._events[next(iter(self._events))]  # least recently used
+        q.append(now)
+        self._events[key] = q
 
-    def _sweep(self, now: float) -> None:
-        if now - self._last_sweep < 60:
+    def _sweep(self, now: float, force: bool = False) -> None:
+        if not force and now - self._last_sweep < 60:
             return
         self._last_sweep = now
         for key in list(self._events):

@@ -5,7 +5,7 @@ announced stream to a local TLS server. akdbx's own broker implements the
 same protocol; this module exists for tests and for manual checks of a relay
 deployment:
 
-    python -m akdbx_relay.testclient --relay https://akdbx.link --state ./broker.json demo
+    python -m akdbx_relay.testclient --relay https://relay.akdbx.link:8443 --state ./broker.json demo
 
 The demo command registers (once), creates an ECDSA P-256 key and CSR, gets
 a certificate, serves a small HTTPS page on 127.0.0.1, and prints the public
@@ -17,13 +17,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import http.client
 import json
 import logging
 import os
 import random
+import socket
 import ssl
-import urllib.error
-import urllib.request
+import urllib.parse
 
 import websockets
 from websockets.asyncio.client import connect
@@ -39,36 +40,65 @@ class RelayAPIError(Exception):
         self.body = body
 
 
+DEFAULT_RELAY = "https://relay.akdbx.link:8443"
+
+
+class _HTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS to `connect_host` while TLS (SNI, certificate check) and Host use the URL's name."""
+
+    def __init__(self, host: str, port: int, *, connect_host: str | None = None, **kwargs) -> None:
+        super().__init__(host, port, **kwargs)
+        self._connect_host = connect_host
+
+    def connect(self) -> None:
+        if not self._connect_host:
+            super().connect()
+            return
+        sock = socket.create_connection((self._connect_host, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
 def _post_json(url: str, body: dict, secret: str | None = None,
-               ssl_context: ssl.SSLContext | None = None, timeout: float = 120) -> dict:
+               ssl_context: ssl.SSLContext | None = None, timeout: float = 120,
+               connect_host: str | None = None) -> dict:
     headers = {"Content-Type": "application/json", "User-Agent": "akdbx-relay-testclient"}
     if secret:
         headers["Authorization"] = f"Bearer {secret}"
-    req = urllib.request.Request(url, json.dumps(body).encode(), headers=headers, method="POST")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        raise ValueError("the relay URL must start with https://")
+    conn = _HTTPSConnection(parts.hostname, parts.port or 443, connect_host=connect_host,
+                            timeout=timeout, context=ssl_context or ssl.create_default_context())
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        try:
-            payload = json.loads(exc.read())
-        except ValueError:
-            payload = {}
-        raise RelayAPIError(exc.code, payload) from None
+        conn.request("POST", parts.path or "/", json.dumps(body).encode(), headers)
+        resp = conn.getresponse()
+        data = resp.read()
+    finally:
+        conn.close()
+    try:
+        payload = json.loads(data) if data else {}
+    except ValueError:
+        payload = {}
+    if resp.status >= 400:
+        raise RelayAPIError(resp.status, payload if isinstance(payload, dict) else {})
+    return payload
 
 
 async def register(relay_url: str, client: str = "akdbx-relay-testclient/1",
-                   ssl_context: ssl.SSLContext | None = None) -> dict:
+                   ssl_context: ssl.SSLContext | None = None, connect_host: str | None = None) -> dict:
     return await asyncio.to_thread(
         _post_json, relay_url.rstrip("/") + "/api/v1/register",
-        {"protocol": 1, "client": client}, None, ssl_context,
+        {"protocol": 1, "client": client}, None, ssl_context, 120, connect_host,
     )
 
 
 async def request_certificate(relay_url: str, secret: str, csr_pem: str,
-                              ssl_context: ssl.SSLContext | None = None) -> dict:
+                              ssl_context: ssl.SSLContext | None = None,
+                              connect_host: str | None = None) -> dict:
+    # The relay answers within its certificate deadline (90 s by default).
     return await asyncio.to_thread(
         _post_json, relay_url.rstrip("/") + "/api/v1/certificate",
-        {"csr": csr_pem}, secret, ssl_context,
+        {"csr": csr_pem}, secret, ssl_context, 120, connect_host,
     )
 
 
@@ -76,17 +106,16 @@ def _ws_base(relay_url: str) -> str:
     url = relay_url.rstrip("/")
     if url.startswith("https://"):
         return "wss://" + url[len("https://"):]
-    if url.startswith("http://"):
-        return "ws://" + url[len("http://"):]
-    raise ValueError("relay URL must start with http:// or https://")
+    raise ValueError("the relay URL must start with https://")
 
 
 class BrokerClient:
     """Keeps the control channel up and splices streams to local_host:local_port."""
 
     def __init__(self, relay_url: str, secret: str, local_port: int, local_host: str = "127.0.0.1",
-                 ssl_context: ssl.SSLContext | None = None) -> None:
+                 ssl_context: ssl.SSLContext | None = None, connect_host: str | None = None) -> None:
         self.ws_base = _ws_base(relay_url)
+        self.connect_host = connect_host
         self._secret = secret
         self.local_host = local_host
         self.local_port = local_port
@@ -101,9 +130,10 @@ class BrokerClient:
         return {"Authorization": f"Bearer {self._secret}"}
 
     def _connect(self, path: str):
-        kwargs = {"additional_headers": self._headers(), "max_size": 1 << 20, "open_timeout": 10}
-        if self.ws_base.startswith("wss://"):
-            kwargs["ssl"] = self.ssl_context or ssl.create_default_context()
+        kwargs: dict = {"additional_headers": self._headers(), "max_size": 1 << 20, "open_timeout": 10,
+                        "ssl": self.ssl_context or ssl.create_default_context()}
+        if self.connect_host:
+            kwargs["host"] = self.connect_host
         return connect(self.ws_base + path, **kwargs)
 
     async def run(self) -> None:
@@ -212,19 +242,20 @@ def _write_private(path: str, data: bytes) -> None:
         fh.write(data)
 
 
-async def _demo(relay_url: str, state_path: str, local_port: int) -> None:
+async def _demo(relay_url: str, state_path: str, local_port: int, ca_file: str | None = None) -> None:
+    relay_ctx = ssl.create_default_context(cafile=ca_file) if ca_file else None
     if os.path.exists(state_path):
         with open(state_path) as fh:
             state = json.load(fh)
     else:
-        state = await register(relay_url)
+        state = await register(relay_url, ssl_context=relay_ctx)
         _write_private(state_path, json.dumps(state).encode())
     name = state["name"]
     key_path = state_path + ".key.pem"
     cert_path = state_path + ".chain.pem"
     if not os.path.exists(cert_path):
         key_pem, csr_pem = make_key_and_csr(name)
-        result = await request_certificate(relay_url, state["secret"], csr_pem)
+        result = await request_certificate(relay_url, state["secret"], csr_pem, ssl_context=relay_ctx)
         _write_private(key_path, key_pem)
         _write_private(cert_path, result["certificate"].encode())
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -241,21 +272,22 @@ async def _demo(relay_url: str, state_path: str, local_port: int) -> None:
 
     server = await asyncio.start_server(page, "127.0.0.1", local_port, ssl=ctx)
     port = server.sockets[0].getsockname()[1]
-    client = BrokerClient(relay_url, state["secret"], port)
+    client = BrokerClient(relay_url, state["secret"], port, ssl_context=relay_ctx)
     print(f"public URL: https://{name}:{state['public_port']}/")
     await client.run()
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m akdbx_relay.testclient")
-    parser.add_argument("--relay", default="https://akdbx.link")
+    parser.add_argument("--relay", default=DEFAULT_RELAY, help="control API base URL (default %(default)s)")
     parser.add_argument("--state", required=True, help="private state file (created with mode 0600)")
     parser.add_argument("--local-port", type=int, default=0)
+    parser.add_argument("--ca-file", help="trust these CA certificates for the relay (for example staging roots)")
     parser.add_argument("command", choices=["demo"])
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     try:
-        asyncio.run(_demo(args.relay, args.state, args.local_port))
+        asyncio.run(_demo(args.relay, args.state, args.local_port, args.ca_file))
     except KeyboardInterrupt:
         pass
     return 0

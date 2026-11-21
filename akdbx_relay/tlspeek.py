@@ -19,6 +19,8 @@ _HANDSHAKE_CLIENT_HELLO = 1
 _EXT_SERVER_NAME = 0
 _NAME_TYPE_HOST = 0
 _MAX_RECORD = 2**14
+# Most TLS records one ClientHello may span.
+MAX_RECORDS = 8
 _LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 
@@ -66,39 +68,73 @@ class _Cursor:
         return self.end - self.pos
 
 
-def _handshake_bytes(buf: bytes, max_bytes: int) -> bytes:
-    """Join handshake-record payloads until one full handshake message exists."""
-    payload = bytearray()
-    pos = 0
-    needed: int | None = None
-    while True:
-        if needed is not None and len(payload) >= needed:
-            return bytes(payload[:needed])
-        if len(buf) - pos < 5:
-            if len(buf) >= max_bytes:
-                raise ClientHelloError("ClientHello too large")
-            raise NeedMoreData
-        ctype = buf[pos]
-        major = buf[pos + 1]
-        length = int.from_bytes(buf[pos + 3 : pos + 5], "big")
-        if ctype != _CONTENT_HANDSHAKE:
-            raise ClientHelloError("not a TLS handshake record")
-        if major != 3:
-            raise ClientHelloError("unsupported record version")
-        if length == 0 or length > _MAX_RECORD:
-            raise ClientHelloError("bad record length")
-        if len(buf) - pos - 5 < length:
-            if pos + 5 + length > max_bytes:
-                raise ClientHelloError("ClientHello too large")
-            raise NeedMoreData
-        payload += buf[pos + 5 : pos + 5 + length]
-        pos += 5 + length
-        if needed is None and len(payload) >= 4:
-            if payload[0] != _HANDSHAKE_CLIENT_HELLO:
-                raise ClientHelloError("first handshake message is not ClientHello")
-            needed = 4 + int.from_bytes(payload[1:4], "big")
-            if needed > max_bytes:
-                raise ClientHelloError("ClientHello too large")
+class ClientHelloParser:
+    """Incremental ClientHello reader: each byte is examined once.
+
+    feed() takes the next bytes from the connection. It returns True when
+    the full ClientHello is buffered (then `sni` holds the result), False
+    when more bytes are needed, and raises ClientHelloError for malformed or
+    oversized input. Record headers and payloads are consumed as they
+    arrive, so many small records cost linear time, and more than
+    MAX_RECORDS records are refused (real clients use one or two).
+    """
+
+    def __init__(self, max_bytes: int = MAX_CLIENT_HELLO_BYTES) -> None:
+        self.max_bytes = max_bytes
+        self.records = 0
+        self.total = 0  # bytes fed so far
+        self.done = False
+        self.sni: str | None = None
+        self._pending = bytearray()  # bytes of the current record not yet consumed
+        self._record_left = 0  # payload bytes still due for the current record
+        self._payload = bytearray()  # joined handshake payload
+        self._needed: int | None = None  # full handshake message length, once known
+
+    def feed(self, data: bytes) -> bool:
+        if self.done:
+            return True
+        self.total += len(data)
+        self._pending += data
+        while True:
+            if self._record_left == 0:
+                if len(self._pending) < 5:
+                    break
+                header = bytes(self._pending[:5])
+                del self._pending[:5]
+                if header[0] != _CONTENT_HANDSHAKE:
+                    raise ClientHelloError("not a TLS handshake record")
+                if header[1] != 3:
+                    raise ClientHelloError("unsupported record version")
+                length = int.from_bytes(header[3:5], "big")
+                if length == 0 or length > _MAX_RECORD:
+                    raise ClientHelloError("bad record length")
+                self.records += 1
+                if self.records > MAX_RECORDS:
+                    raise ClientHelloError("ClientHello split into too many records")
+                consumed = self.total - len(self._pending)
+                if consumed + length > self.max_bytes:
+                    raise ClientHelloError("ClientHello too large")
+                self._record_left = length
+            take = min(self._record_left, len(self._pending))
+            if take == 0:
+                break
+            self._payload += self._pending[:take]
+            del self._pending[:take]
+            self._record_left -= take
+            if self._needed is None and len(self._payload) >= 4:
+                if self._payload[0] != _HANDSHAKE_CLIENT_HELLO:
+                    raise ClientHelloError("first handshake message is not ClientHello")
+                self._needed = 4 + int.from_bytes(self._payload[1:4], "big")
+                if self._needed > self.max_bytes:
+                    raise ClientHelloError("ClientHello too large")
+            if self._needed is not None and len(self._payload) >= self._needed:
+                self.sni = _parse_message(bytes(self._payload[: self._needed]))
+                self.done = True
+                self._pending.clear()
+                return True
+        if self.total >= self.max_bytes:
+            raise ClientHelloError("ClientHello too large")
+        return False
 
 
 def _valid_hostname(raw: bytes) -> str:
@@ -126,7 +162,14 @@ def parse_client_hello(buf: bytes, max_bytes: int = MAX_CLIENT_HELLO_BYTES) -> s
     """
     if buf and buf[0] != _CONTENT_HANDSHAKE:
         raise ClientHelloError("not a TLS handshake record")
-    msg = _handshake_bytes(buf, max_bytes)
+    parser = ClientHelloParser(max_bytes)
+    if not parser.feed(buf):
+        raise NeedMoreData
+    return parser.sni
+
+
+def _parse_message(msg: bytes) -> str | None:
+    """Parse one complete ClientHello handshake message; return the SNI name."""
     cur = _Cursor(msg)
     cur.u8()  # handshake type, checked above
     body = cur.sub(cur.u24())
@@ -188,7 +231,8 @@ async def read_client_hello(
     replayed to the broker unchanged. Raises ClientHelloError, TimeoutError
     or EOFError.
     """
-    buf = b""
+    buf = bytearray()
+    parser = ClientHelloParser(max_bytes)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while True:
@@ -199,8 +243,5 @@ async def read_client_hello(
         if not chunk:
             raise EOFError("connection closed before ClientHello")
         buf += chunk
-        try:
-            return buf, parse_client_hello(buf, max_bytes)
-        except NeedMoreData:
-            if len(buf) >= max_bytes:
-                raise ClientHelloError("ClientHello too large") from None
+        if parser.feed(chunk):
+            return bytes(buf), parser.sni

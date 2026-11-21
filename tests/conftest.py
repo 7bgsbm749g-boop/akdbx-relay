@@ -7,8 +7,8 @@ from .helpers import start_relay
 async def relay_factory(tmp_path):
     relays = []
 
-    async def make(issuer=None, **overrides):
-        r = await start_relay(tmp_path / f"r{len(relays)}", issuer, **overrides)
+    async def make(issuer=None, managed_tls=False, **overrides):
+        r = await start_relay(tmp_path / f"r{len(relays)}", issuer, managed_tls, **overrides)
         relays.append(r)
         return r
 

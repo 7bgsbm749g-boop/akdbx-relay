@@ -36,8 +36,11 @@ CREATE TABLE IF NOT EXISTS certificates (
 );
 CREATE INDEX IF NOT EXISTS certificates_issued ON certificates (issued_at);
 CREATE INDEX IF NOT EXISTS certificates_broker ON certificates (broker_id, issued_at);
-CREATE TABLE IF NOT EXISTS acme_txt (
-    record_id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS acme_txt_markers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    record_id TEXT,
     created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (
@@ -45,6 +48,16 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 """
+
+
+@dataclass(frozen=True)
+class TxtMarker:
+    """A DNS-01 TXT record the relay is creating or has created."""
+
+    id: int
+    name: str
+    content: str
+    record_id: str | None
 
 
 @dataclass(frozen=True)
@@ -66,6 +79,22 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        # Drafts kept only record ids in acme_txt; carry them over as markers.
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='acme_txt'").fetchone():
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute(
+                    "INSERT INTO acme_txt_markers (name, content, record_id, created_at) "
+                    "SELECT '', '', record_id, created_at FROM acme_txt"
+                )
+                self.db.execute("DROP TABLE acme_txt")
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
+            self.db.execute("COMMIT")
 
     def close(self) -> None:
         self.db.close()
@@ -143,19 +172,27 @@ class Store:
         ).fetchall()
         return [r[0] for r in rows]
 
-    # ACME TXT records that may need cleanup after a crash
+    # Cleanup markers for ACME TXT records. A marker is written before the
+    # record is created and removed after the record is deleted.
 
-    def add_txt_record(self, record_id: str) -> None:
-        self.db.execute(
-            "INSERT OR REPLACE INTO acme_txt (record_id, created_at) VALUES (?, ?)",
-            (record_id, self.clock()),
+    def add_txt_marker(self, name: str, content: str) -> TxtMarker:
+        cur = self.db.execute(
+            "INSERT INTO acme_txt_markers (name, content, record_id, created_at) VALUES (?, ?, NULL, ?)",
+            (name, content, self.clock()),
         )
+        return TxtMarker(int(cur.lastrowid), name, content, None)
 
-    def remove_txt_record(self, record_id: str) -> None:
-        self.db.execute("DELETE FROM acme_txt WHERE record_id = ?", (record_id,))
+    def set_txt_marker_record(self, marker_id: int, record_id: str) -> None:
+        self.db.execute("UPDATE acme_txt_markers SET record_id = ? WHERE id = ?", (record_id, marker_id))
 
-    def txt_records(self) -> list[str]:
-        return [r[0] for r in self.db.execute("SELECT record_id FROM acme_txt").fetchall()]
+    def remove_txt_marker(self, marker_id: int) -> None:
+        self.db.execute("DELETE FROM acme_txt_markers WHERE id = ?", (marker_id,))
+
+    def txt_markers(self) -> list[TxtMarker]:
+        rows = self.db.execute(
+            "SELECT id, name, content, record_id FROM acme_txt_markers ORDER BY id"
+        ).fetchall()
+        return [TxtMarker(r[0], r[1], r[2], r[3]) for r in rows]
 
     # Meta
 

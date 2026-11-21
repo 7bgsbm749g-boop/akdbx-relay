@@ -81,6 +81,28 @@ def test_token_bucket():
     assert len(tb) <= 2  # idle keys swept
 
 
+def test_token_bucket_evicts_when_full():
+    # R8: a full table used to refuse every new address.
+    clock = Clock()
+    tb = TokenBucket(rate=1, burst=2, clock=clock, max_keys=2)
+    assert tb.allow("a") and tb.allow("b")
+    assert tb.allow("a")  # "a" is now the most recently used
+    assert tb.allow("c")  # evicts "b", the least recently used
+    assert len(tb) == 2
+    assert not tb.allow("a")  # "a" kept its (empty) bucket
+
+
+def test_sliding_window_evicts_when_full():
+    clock = Clock()
+    sw = SlidingWindow(limit=1, window=DAY, clock=clock, max_keys=2)
+    sw.record("a")
+    sw.record("b")
+    assert sw.check("c") == 0
+    sw.record("c")
+    assert len(sw) == 2
+    assert sw.check("c") > 0
+
+
 def test_sliding_window():
     clock = Clock()
     sw = SlidingWindow(limit=2, window=DAY, clock=clock)
@@ -190,6 +212,27 @@ def test_store_and_budget(tmp_path):
     store.close()
 
 
+def test_txt_markers_and_migration(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "s.sqlite3")
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE acme_txt (record_id TEXT PRIMARY KEY, created_at REAL NOT NULL)")
+    db.execute("INSERT INTO acme_txt VALUES ('old-record', 1.0)")
+    db.commit()
+    db.close()
+    store = Store(path)
+    markers = store.txt_markers()
+    assert [(m.record_id, m.name) for m in markers] == [("old-record", "")]
+    m = store.add_txt_marker("_acme-challenge.x.akdbx.link", "value")
+    assert m.record_id is None
+    store.set_txt_marker_record(m.id, "rid")
+    assert store.txt_markers()[-1].record_id == "rid"
+    store.remove_txt_marker(m.id)
+    store.remove_txt_marker(markers[0].id)
+    assert store.txt_markers() == []
+    store.close()
+
+
 def test_store_file_mode_and_no_plain_secret(tmp_path):
     import os
     path = tmp_path / "state" / "s.sqlite3"
@@ -218,8 +261,29 @@ def test_config_from_env():
     assert "tok" not in repr(cfg)
 
 
+def test_config_control_host_defaults():
+    cfg = Config.from_env({})
+    assert cfg.control_hostname == "relay.akdbx.link"
+    assert cfg.health_host == "127.0.0.1" and cfg.managed_control_tls
+    assert cfg.control_tls_files == ("/var/lib/akdbx-relay/control-chain.pem",
+                                     "/var/lib/akdbx-relay/control-key.pem")
+    assert cfg.certificate_deadline == 90
+    other = Config.from_env({"AKDBX_RELAY_DOMAIN": "example.org", "AKDBX_RELAY_HEALTH_HOST": ""})
+    assert other.control_hostname == "relay.example.org" and other.health_host == ""
+
+
 @pytest.mark.parametrize("env", [
     {"AKDBX_RELAY_PUBLIC_PORT": "x"},
+    # R5: no proxy header is trusted, and the old proxy settings are refused.
+    {"AKDBX_RELAY_TRUSTED_PROXY_IPS": "127.0.0.1"},
+    {"AKDBX_RELAY_CONTROL_HOST": "127.0.0.1"},
+    {"AKDBX_RELAY_CONTROL_PORT": "8771"},
+    {"AKDBX_RELAY_HEALTH_HOST": "0.0.0.0"},
+    {"AKDBX_RELAY_HEALTH_HOST": "localhost"},
+    {"AKDBX_RELAY_CONTROL_HOSTNAME": "abcdefghijkl.akdbx.link"},  # a broker-shaped name
+    {"AKDBX_RELAY_CONTROL_HOSTNAME": "bad_name.akdbx.link"},
+    {"AKDBX_RELAY_CONTROL_CERT_FILE": "/x.pem"},  # key file missing
+    {"AKDBX_RELAY_CERTIFICATE_DEADLINE": "1"},
     {"AKDBX_RELAY_CERT_BUDGET": "50", "AKDBX_RELAY_CERT_HARD_LIMIT": "45"},
     {"AKDBX_RELAY_DOMAIN": "localhost"},
     {"AKDBX_RELAY_CONN_RATE_PER_IP": "0"},

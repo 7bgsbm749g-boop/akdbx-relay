@@ -5,6 +5,8 @@
 #   sudo deploy/setup.sh --start    also enable and (re)start the service
 #
 # It does not change Caddy, DNS or the firewall. See deploy/DEPLOY.md.
+# The control API is served by the relay itself on port 8443 for
+# relay.akdbx.link (DNS only); Caddy serves only the landing page.
 set -euo pipefail
 
 START=0
@@ -64,11 +66,22 @@ else
 	chmod 0600 "$ETC/relay.env"
 	chown root:root "$ETC/relay.env"
 fi
+# Settings from drafts that served the API behind Caddy and Cloudflare. The
+# relay refuses them; say what to do instead of failing later.
+for old in AKDBX_RELAY_CONTROL_HOST AKDBX_RELAY_CONTROL_PORT AKDBX_RELAY_TRUSTED_PROXY_IPS; do
+	if grep -qE "^[[:space:]]*${old}=" "$ETC/relay.env"; then
+		echo "$ETC/relay.env sets $old, which this version no longer supports." >&2
+		echo "Remove it (see deploy/relay.env.example: AKDBX_RELAY_HEALTH_HOST/PORT, CONTROL_HOSTNAME)." >&2
+		exit 1
+	fi
+done
 
-# 4. State directory (systemd also creates it through StateDirectory=).
+# 4. State directory (systemd also creates it through StateDirectory=). It
+#    holds the SQLite state, the ACME account key and the relay's own control
+#    TLS key and certificate, all 0600.
 install -d -m 0700 -o akdbx-relay -g akdbx-relay /var/lib/akdbx-relay
 
-# 5. Landing page for Caddy.
+# 5. Landing page for Caddy (the only thing Caddy serves for akdbx.link).
 install -d -m 0755 "$WWW"
 install -m 0644 "$SRC/deploy/www/index.html" "$WWW/index.html"
 

@@ -8,11 +8,14 @@ signs the CSR with a local CA.
 from __future__ import annotations
 
 import base64
+import datetime
 import hashlib
 import itertools
 import json
 import secrets
 import threading
+import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import josepy as jose
@@ -99,7 +102,18 @@ class FakeCloudflare(_Base):
         self.created: list[dict] = []
         self.deleted: list[str] = []
         self.fail_delete = False
+        self.create_delay = 0.0  # seconds before a create answers (after the record exists)
+        self.list_calls = 0
         super().__init__()
+
+    def add_record(self, name: str, content: str, comment: str, age_seconds: float = 0.0) -> str:
+        """Put a TXT record straight into the zone (as if created earlier)."""
+        created = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=age_seconds)
+        rid = secrets.token_hex(8)
+        with self.lock:
+            self.records[rid] = {"type": "TXT", "name": name, "content": content, "comment": comment,
+                                 "created_on": created.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}
+        return rid
 
     @property
     def api(self) -> str:
@@ -113,13 +127,32 @@ class FakeCloudflare(_Base):
         if h.headers.get("Authorization") != f"Bearer {self.token}":
             return self.send(h, 403, {"success": False, "errors": [{"code": 10000, "message": "auth"}]})
         prefix = f"/client/v4/zones/{self.zone_id}/dns_records"
-        if method == "POST" and h.path == prefix:
+        path, _, query = h.path.partition("?")
+        if method == "GET" and path == prefix:
+            q = dict(urllib.parse.parse_qsl(query))
+            self.list_calls += 1
+            with self.lock:
+                rows = [dict(r, id=rid) for rid, r in self.records.items()
+                        if r["type"] == q.get("type", r["type"]) and r["name"] == q.get("name", r["name"])]
+            per_page = int(q.get("per_page", "100"))
+            page = int(q.get("page", "1"))
+            total_pages = max(1, -(-len(rows) // per_page))
+            chunk = rows[(page - 1) * per_page: page * per_page]
+            # Cloudflare returns TXT content in quotes.
+            chunk = [dict(r, content='"' + r["content"] + '"') for r in chunk]
+            return self.send(h, 200, {"success": True, "result": chunk,
+                                      "result_info": {"page": page, "per_page": per_page,
+                                                      "total_pages": total_pages}})
+        if method == "POST" and path == prefix:
             rec = json.loads(body)
             assert rec["type"] == "TXT"
             rid = secrets.token_hex(8)
+            rec["created_on"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
             with self.lock:
                 self.records[rid] = rec
                 self.created.append(dict(rec, id=rid))
+            if self.create_delay:
+                time.sleep(self.create_delay)
             return self.send(h, 200, {"success": True, "result": {"id": rid}})
         if method == "DELETE" and h.path.startswith(prefix + "/"):
             rid = h.path[len(prefix) + 1:]

@@ -3,9 +3,36 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
+from dataclasses import dataclass
+
+# Upper bound on pages read when listing TXT records (100 records per page).
+MAX_LIST_PAGES = 50
+
+
+@dataclass(frozen=True)
+class TxtRecord:
+    id: str
+    name: str
+    content: str
+    comment: str
+    created: datetime.datetime | None
+
+
+def _parse_time(value: object) -> datetime.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
 
 
 class CloudflareError(Exception):
@@ -52,12 +79,12 @@ class CloudflareDNS:
             raise CloudflareError(f"Cloudflare API {method} was not successful {codes}".strip())
         return payload
 
-    def create_txt_sync(self, name: str, content: str) -> str:
+    def create_txt_sync(self, name: str, content: str, comment: str) -> str:
         payload = self._request(
             "POST",
             "/dns_records",
             {"type": "TXT", "name": name, "content": content, "ttl": 60, "proxied": False,
-             "comment": "akdbx-relay ACME challenge"},
+             "comment": comment},
         )
         record_id = payload.get("result", {}).get("id")
         if not isinstance(record_id, str) or not record_id:
@@ -72,8 +99,35 @@ class CloudflareDNS:
                 return  # already gone
             raise
 
-    async def create_txt(self, name: str, content: str) -> str:
-        return await asyncio.to_thread(self.create_txt_sync, name, content)
+    def list_txt_sync(self, name: str | None = None) -> list[TxtRecord]:
+        """TXT records in the zone (only those named `name`, if given)."""
+        out: list[TxtRecord] = []
+        for page in range(1, MAX_LIST_PAGES + 1):
+            query = {"type": "TXT", "per_page": "100", "page": str(page)}
+            if name is not None:
+                query["name"] = name
+            payload = self._request("GET", "/dns_records?" + urllib.parse.urlencode(query))
+            for rec in payload.get("result") or []:
+                if not isinstance(rec, dict) or not isinstance(rec.get("id"), str):
+                    continue
+                out.append(TxtRecord(
+                    id=rec["id"],
+                    name=str(rec.get("name") or ""),
+                    content=str(rec.get("content") or ""),
+                    comment=str(rec.get("comment") or ""),
+                    created=_parse_time(rec.get("created_on")),
+                ))
+            info = payload.get("result_info") or {}
+            total_pages = info.get("total_pages") if isinstance(info, dict) else None
+            if not isinstance(total_pages, int) or page >= total_pages:
+                break
+        return out
+
+    async def create_txt(self, name: str, content: str, comment: str) -> str:
+        return await asyncio.to_thread(self.create_txt_sync, name, content, comment)
+
+    async def list_txt(self, name: str | None = None) -> list[TxtRecord]:
+        return await asyncio.to_thread(self.list_txt_sync, name)
 
     async def delete_txt(self, record_id: str) -> None:
         await asyncio.to_thread(self.delete_txt_sync, record_id)

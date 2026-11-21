@@ -11,7 +11,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from akdbx_relay.testclient import BrokerClient, register
 
-from .helpers import CA, client_hello, http
+from .helpers import CA, client_hello, client_kw, control_client_context, relay_url
 
 PAGE = b"secret page body: only the broker can decrypt this"
 
@@ -72,10 +72,10 @@ def ca():
 
 
 async def setup_broker(relay, ca, tmp_path):
-    url = f"http://127.0.0.1:{relay.control_port}"
-    reg = await register(url)
+    url = relay_url(relay)
+    reg = await register(url, **client_kw())
     server, local_port, seen = await start_tls_page(ca, reg["name"], tmp_path)
-    client = BrokerClient(url, reg["secret"], local_port)
+    client = BrokerClient(url, reg["secret"], local_port, **client_kw())
     task = asyncio.create_task(client.run())
     await asyncio.wait_for(client.connected.wait(), 5)
     for _ in range(100):
@@ -94,7 +94,9 @@ async def teardown(client, task, server):
 
 
 async def test_end_to_end_https_through_relay(relay_factory, ca, tmp_path):
-    relay = await relay_factory()
+    # Phones and the broker's stream connections all come from 127.0.0.1 and
+    # share the per-address limits on :8443; this test opens ~30 at once.
+    relay = await relay_factory(conn_burst_per_ip=100, max_handshakes_per_ip=32)
     reg, client, task, server, seen = await setup_broker(relay, ca, tmp_path)
     try:
         for _ in range(3):
@@ -113,8 +115,8 @@ async def test_end_to_end_https_through_relay(relay_factory, ca, tmp_path):
 
 async def test_unknown_names_and_offline_brokers_are_closed(relay_factory, ca, tmp_path):
     relay = await relay_factory()
-    url = f"http://127.0.0.1:{relay.control_port}"
-    offline = await register(url)
+    url = relay_url(relay)
+    offline = await register(url, **client_kw())
     port = relay.public_port
     assert await closed_without_data(port, client_hello(offline["name"]))  # no control channel
     assert await closed_without_data(port, client_hello("zzzzzzzzzzzz.akdbx.link"))  # unknown
@@ -134,14 +136,18 @@ async def test_client_hello_timeout_closes(relay_factory):
     writer.close()
 
 
+def _wss(relay, path, secret):
+    return connect(f"wss://{relay.cfg.control_hostname}:{relay.public_port}{path}",
+                   additional_headers={"Authorization": f"Bearer {secret}"},
+                   ssl=control_client_context(), host="127.0.0.1")
+
+
 async def control(relay, secret):
-    return connect(f"ws://127.0.0.1:{relay.control_port}/api/v1/connect",
-                   additional_headers={"Authorization": f"Bearer {secret}"})
+    return _wss(relay, "/api/v1/connect", secret)
 
 
 async def stream_ws(relay, secret, stream_id):
-    return connect(f"ws://127.0.0.1:{relay.control_port}/api/v1/stream/{stream_id}",
-                   additional_headers={"Authorization": f"Bearer {secret}"})
+    return _wss(relay, f"/api/v1/stream/{stream_id}", secret)
 
 
 async def wait_for(predicate, timeout=5.0):
@@ -155,9 +161,9 @@ async def wait_for(predicate, timeout=5.0):
 
 async def test_stream_ids_are_single_use_and_bound_to_the_broker(relay_factory):
     relay = await relay_factory()
-    url = f"http://127.0.0.1:{relay.control_port}"
-    a = await register(url)
-    b = await register(url)
+    url = relay_url(relay)
+    a = await register(url, **client_kw())
+    b = await register(url, **client_kw())
     async with await control(relay, a["secret"]) as ctl:
         await wait_for(lambda: a["broker_id"] in relay.controls)
         reader, writer = await asyncio.open_connection("127.0.0.1", relay.public_port)
@@ -199,7 +205,7 @@ async def test_stream_ids_are_single_use_and_bound_to_the_broker(relay_factory):
 
 async def test_text_frame_on_stream_is_protocol_error(relay_factory):
     relay = await relay_factory()
-    a = await register(f"http://127.0.0.1:{relay.control_port}")
+    a = await register(relay_url(relay), **client_kw())
     async with await control(relay, a["secret"]) as ctl:
         await wait_for(lambda: a["broker_id"] in relay.controls)
         reader, writer = await asyncio.open_connection("127.0.0.1", relay.public_port)
@@ -218,7 +224,7 @@ async def test_text_frame_on_stream_is_protocol_error(relay_factory):
 
 async def test_stream_open_timeout(relay_factory):
     relay = await relay_factory(stream_open_timeout=0.3)
-    a = await register(f"http://127.0.0.1:{relay.control_port}")
+    a = await register(relay_url(relay), **client_kw())
     async with await control(relay, a["secret"]) as ctl:
         await wait_for(lambda: a["broker_id"] in relay.controls)
         reader, writer = await asyncio.open_connection("127.0.0.1", relay.public_port)
@@ -235,7 +241,7 @@ async def test_stream_open_timeout(relay_factory):
 
 async def test_stream_idle_timeout(relay_factory):
     relay = await relay_factory(stream_idle_timeout=0.4)
-    a = await register(f"http://127.0.0.1:{relay.control_port}")
+    a = await register(relay_url(relay), **client_kw())
     async with await control(relay, a["secret"]) as ctl:
         await wait_for(lambda: a["broker_id"] in relay.controls)
         reader, writer = await asyncio.open_connection("127.0.0.1", relay.public_port)
@@ -252,9 +258,9 @@ async def test_stream_idle_timeout(relay_factory):
 
 async def test_per_broker_and_global_stream_caps(relay_factory):
     relay = await relay_factory(max_streams_per_broker=2, max_streams_total=3, stream_open_timeout=1.5)
-    url = f"http://127.0.0.1:{relay.control_port}"
-    a = await register(url)
-    b = await register(url)
+    url = relay_url(relay)
+    a = await register(url, **client_kw())
+    b = await register(url, **client_kw())
     async with await control(relay, a["secret"]) as ca_, await control(relay, b["secret"]) as cb:
         await wait_for(lambda: a["broker_id"] in relay.controls and b["broker_id"] in relay.controls)
         conns = []
@@ -293,7 +299,7 @@ async def test_connection_rate_limit_per_ip(relay_factory):
 
 async def test_control_ping_pong_and_timeout(relay_factory):
     relay = await relay_factory(control_ping_interval=0.1, control_pong_timeout=0.4)
-    a = await register(f"http://127.0.0.1:{relay.control_port}")
+    a = await register(relay_url(relay), **client_kw())
     async with await control(relay, a["secret"]) as ctl:
         # Answer two pings, then go silent.
         for _ in range(2):
@@ -319,7 +325,7 @@ async def test_answering_client_stays_connected(relay_factory, ca, tmp_path):
 
 async def test_new_control_connection_replaces_old(relay_factory):
     relay = await relay_factory()
-    a = await register(f"http://127.0.0.1:{relay.control_port}")
+    a = await register(relay_url(relay), **client_kw())
     async with await control(relay, a["secret"]) as first:
         await wait_for(lambda: a["broker_id"] in relay.controls)
         old = relay.controls[a["broker_id"]]
@@ -335,7 +341,7 @@ async def test_new_control_connection_replaces_old(relay_factory):
 
 async def test_binary_on_control_channel_closes_it(relay_factory):
     relay = await relay_factory()
-    a = await register(f"http://127.0.0.1:{relay.control_port}")
+    a = await register(relay_url(relay), **client_kw())
     async with await control(relay, a["secret"]) as ctl:
         await ctl.send(b"\x00\x01")
         with pytest.raises(ConnectionClosed) as exc:
@@ -366,8 +372,8 @@ async def test_broker_reconnects_after_relay_drop(relay_factory, ca, tmp_path):
 
 async def test_large_transfer(relay_factory, ca, tmp_path):
     relay = await relay_factory()
-    url = f"http://127.0.0.1:{relay.control_port}"
-    reg = await register(url)
+    url = relay_url(relay)
+    reg = await register(url, **client_kw())
     chain, key = ca.leaf(reg["name"])
     (tmp_path / "c.pem").write_bytes(chain)
     (tmp_path / "k.pem").write_bytes(key)
@@ -383,7 +389,7 @@ async def test_large_transfer(relay_factory, ca, tmp_path):
         writer.close()
 
     server = await asyncio.start_server(echo, "127.0.0.1", 0, ssl=ctx)
-    client = BrokerClient(url, reg["secret"], server.sockets[0].getsockname()[1])
+    client = BrokerClient(url, reg["secret"], server.sockets[0].getsockname()[1], **client_kw())
     task = asyncio.create_task(client.run())
     try:
         await asyncio.wait_for(client.connected.wait(), 5)
