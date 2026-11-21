@@ -27,18 +27,20 @@ Deployment notes are in [deploy/DEPLOY.md](deploy/DEPLOY.md).
 ## How it works
 
 ```
-phone --TLS (SNI = <id>.akdbx.link)--> relay :8443 --WebSocket--> broker --> 127.0.0.1 HTTPS page
+phone --TLS (SNI = <id>.akdbx.link)--> relay :443 --WebSocket--> broker --> 127.0.0.1 HTTPS page
 ```
 
-1. A broker registers (`POST https://relay.akdbx.link:8443/api/v1/register`)
+1. A broker registers (`POST https://relay.akdbx.link/api/v1/register`)
    and gets a random name `<id>.akdbx.link` and a bearer secret. The control
-   API shares port 8443: the relay terminates TLS for `relay.akdbx.link`
-   itself, with its own certificate, and passes every other name through.
+   API shares the public port 443: the relay terminates TLS for
+   `relay.akdbx.link` itself, with its own certificate, and passes every
+   other name through. The relay has its own IPv4 address, so port 443 on
+   that address is the relay's alone.
 2. The broker makes its own key and sends only a CSR. The relay gets a Let's
    Encrypt certificate for that one name with the DNS-01 challenge, through
    the Cloudflare API, and returns the certificate chain.
 3. The broker keeps a control WebSocket open to the relay.
-4. A phone connects to `https://<id>.akdbx.link:8443`. The relay reads the
+4. A phone connects to `https://<id>.akdbx.link`. The relay reads the
    server name from the TLS ClientHello (plain text) without terminating TLS,
    asks the broker for a stream, and splices the raw bytes both ways. TLS
    ends in the broker, with the broker's key.
@@ -48,7 +50,7 @@ phone --TLS (SNI = <id>.akdbx.link)--> relay :8443 --WebSocket--> broker --> 127
 - **The relay cannot decrypt.** It never has a broker's private key. It sees
   the server name, connection times and sizes, and TLS ciphertext.
 - **No third party in the control path.** Brokers reach the control API at
-  `https://relay.akdbx.link:8443`, a DNS-only name. TLS ends in the relay,
+  `https://relay.akdbx.link`, a DNS-only name. TLS ends in the relay,
   with a key that only the relay holds, so no proxy or CDN sees the bearer
   secrets that authorize certificate requests and the control channel.
   Caddy and Cloudflare serve only the static landing page at `akdbx.link`.
@@ -74,7 +76,7 @@ phone --TLS (SNI = <id>.akdbx.link)--> relay :8443 --WebSocket--> broker --> 127
   addresses; no forwarded-address header is trusted) exist only in memory,
   for rate limits. The SQLite state holds broker ids, secret hashes, the
   times of issued certificates, and cleanup markers for ACME TXT records.
-- **Limits:** per-IP connection rate on :8443, per-IP open handshakes,
+- **Limits:** per-IP connection rate on the public port, per-IP open handshakes,
   streams and control connections, per-IP registrations per day, per-broker
   and global stream caps, ClientHello size, record-count and time limits,
   WebSocket message and fragment limits, a short wait for a broker's first
@@ -102,9 +104,10 @@ environment take precedence. Never commit a filled-in file.
 | `AKDBX_RELAY_DNS_PROPAGATION_SECONDS` | `10` | Wait after creating the TXT record, before answering the challenge. |
 | `AKDBX_RELAY_CERTIFICATE_DEADLINE` | `90` | Seconds for a whole certificate request: queue wait plus ACME order. Brokers should wait longer than this. |
 | `AKDBX_RELAY_DOMAIN` | `akdbx.link` | Relay domain. Broker names are `<id>.<domain>`. |
-| `AKDBX_RELAY_PUBLIC_HOSTS` | `0.0.0.0,::` | Comma-separated addresses for the public listener. |
-| `AKDBX_RELAY_PUBLIC_PORT` | `8443` | Public listener port. |
-| `AKDBX_RELAY_ADVERTISED_PORT` | public port | `public_port` returned at registration. |
+| `AKDBX_RELAY_PUBLIC_HOSTS` | `0.0.0.0,::` | Comma-separated addresses for the public listener. With port 443, use only addresses where nothing else listens on 443 (for example the relay's own IPv4 and the host IPv6). |
+| `AKDBX_RELAY_PUBLIC_PORT` | `8443` | Public listener port. Recommended: `443`, on a dedicated address (see [deploy/DEPLOY.md](deploy/DEPLOY.md)). |
+| `AKDBX_RELAY_PUBLIC_EXTRA_LISTEN` | (none) | Comma-separated extra public listeners, `IP:PORT` or `[IPv6]:PORT`, with the same behavior as the main one. Use it to keep the old port open while brokers move to a new one, for example `192.0.2.10:8443,[2001:db8::10]:8443`. |
+| `AKDBX_RELAY_ADVERTISED_PORT` | public port | `public_port` returned at registration and by `GET /api/v1/broker`. |
 | `AKDBX_RELAY_CONTROL_HOSTNAME` | `relay.<domain>` | SNI name for which the relay terminates TLS and serves the control API on the public port. Must be DNS only. |
 | `AKDBX_RELAY_CONTROL_CERT_FILE` | (none) | Operator-supplied certificate chain for the control host name. Without it, the relay gets and renews its own certificate through ACME and keeps `control-chain.pem` and `control-key.pem` (0600) next to the state file. |
 | `AKDBX_RELAY_CONTROL_KEY_FILE` | (none) | Private key for `AKDBX_RELAY_CONTROL_CERT_FILE` (set both or neither). |
@@ -162,6 +165,14 @@ AKDBX_RELAY_STATE_PATH=/tmp/relay/relay.sqlite3 AKDBX_RELAY_PUBLIC_HOSTS=127.0.0
 curl -s http://127.0.0.1:8771/api/v1/health
 curl -s --cacert /tmp/relay/control-chain.pem \
   --resolve relay.akdbx.link:8443:127.0.0.1 https://relay.akdbx.link:8443/api/v1/health
+```
+
+The local example keeps the default port 8443, so it needs no privilege. A
+production relay uses port 443 (see [deploy/DEPLOY.md](deploy/DEPLOY.md)),
+for example:
+
+```sh
+curl -s https://relay.akdbx.link/api/v1/health
 ```
 
 The tests run without network access: a fake ACME server and a fake

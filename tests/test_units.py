@@ -291,3 +291,13 @@ def test_config_control_host_defaults():
 def test_config_errors(env):
     with pytest.raises(ConfigError):
         Config.from_env(env)
+
+
+def test_config_extra_listen():
+    from akdbx_relay.config import Config, ConfigError
+    cfg = Config.from_env({"AKDBX_RELAY_PUBLIC_EXTRA_LISTEN": "192.0.2.1:8443, [2001:db8::1]:8443"})
+    assert cfg.public_extra_listen == [("192.0.2.1", 8443), ("2001:db8::1", 8443)]
+    assert Config.from_env({}).public_extra_listen == []
+    for bad in ("relay.example:8443", "192.0.2.1", "192.0.2.1:0", "[2001:db8::1]8443", "192.0.2.1:x"):
+        with pytest.raises(ConfigError):
+            Config.from_env({"AKDBX_RELAY_PUBLIC_EXTRA_LISTEN": bad})

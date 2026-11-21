@@ -58,6 +58,27 @@ def _hosts(raw: str) -> list[str]:
     return [h.strip() for h in raw.split(",") if h.strip()]
 
 
+def _listen(raw: str) -> list[tuple[str, int]]:
+    """Parse ``HOST:PORT,[V6]:PORT`` into (host, port) pairs for extra public listeners."""
+    out: list[tuple[str, int]] = []
+    for item in (part.strip() for part in raw.split(",")):
+        if not item:
+            continue
+        if item.startswith("["):
+            host, sep, port = item[1:].partition("]:")
+        else:
+            host, sep, port = item.rpartition(":")
+        try:
+            ipaddress.ip_address(host)
+            number = int(port)
+        except ValueError:
+            raise ConfigError(f"{_PREFIX}PUBLIC_EXTRA_LISTEN: {item!r} is not IP:PORT or [IPv6]:PORT") from None
+        if not sep or not 1 <= number <= 65535:
+            raise ConfigError(f"{_PREFIX}PUBLIC_EXTRA_LISTEN: {item!r} is not IP:PORT or [IPv6]:PORT")
+        out.append((host, number))
+    return out
+
+
 def _is_hostname(name: str) -> bool:
     return 1 <= len(name) <= 253 and all(_LABEL.match(label) for label in name.split("."))
 
@@ -68,6 +89,9 @@ class Config:
     public_hosts: list[str] = field(default_factory=lambda: ["0.0.0.0", "::"])
     public_port: int = 8443
     advertised_port: int = 8443
+    # Extra public listeners, for example the old port while brokers move to a
+    # new one. Each is an (IP address, port) pair with the same behavior.
+    public_extra_listen: list[tuple[str, int]] = field(default_factory=list)
     # The control API is served on the public port to TLS connections whose
     # SNI is this name; the relay terminates them with its own certificate.
     control_hostname: str = ""
@@ -143,6 +167,7 @@ class Config:
             public_hosts=_hosts(_get(env, "PUBLIC_HOSTS", ",".join(d.public_hosts))),
             public_port=public_port,
             advertised_port=_int(env, "ADVERTISED_PORT", public_port or d.advertised_port, 1),
+            public_extra_listen=_listen(_get(env, "PUBLIC_EXTRA_LISTEN", "")),
             control_hostname=_get(env, "CONTROL_HOSTNAME", "").lower().rstrip("."),
             control_cert_file=_get(env, "CONTROL_CERT_FILE", ""),
             control_key_file=_get(env, "CONTROL_KEY_FILE", ""),

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "akdbx-relay"
-version = "0.1.0"
+version = "0.2.0"
 description = "Relay that forwards encrypted TLS connections to akdbx brokers without decrypting them"
 readme = "README.md"
 license = "MIT"

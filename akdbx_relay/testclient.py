@@ -5,7 +5,7 @@ announced stream to a local TLS server. akdbx's own broker implements the
 same protocol; this module exists for tests and for manual checks of a relay
 deployment:
 
-    python -m akdbx_relay.testclient --relay https://relay.akdbx.link:8443 --state ./broker.json demo
+    python -m akdbx_relay.testclient --relay https://relay.akdbx.link --state ./broker.json demo
 
 The demo command registers (once), creates an ECDSA P-256 key and CSR, gets
 a certificate, serves a small HTTPS page on 127.0.0.1, and prints the public
@@ -40,7 +40,7 @@ class RelayAPIError(Exception):
         self.body = body
 
 
-DEFAULT_RELAY = "https://relay.akdbx.link:8443"
+DEFAULT_RELAY = "https://relay.akdbx.link"
 
 
 class _HTTPSConnection(http.client.HTTPSConnection):

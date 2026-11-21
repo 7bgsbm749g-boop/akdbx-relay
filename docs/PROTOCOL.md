@@ -17,11 +17,16 @@ another public tunnel. Proxies that decrypt HTTPS are strongly discouraged.
   characters from `[a-z2-7]` (base32, no user choice, so nobody can register a
   look-alike name such as `paypal`). The relay refuses reserved labels
   (`www`, `api`, `relay`, `mail`, and any label shorter than 12 characters).
-- Public origin of a broker: `https://<id>.akdbx.link:8443`.
-  Port 8443, because port 443 on the relay host serves other sites through
-  Cloudflare's proxy, which decrypts traffic. The relay must not be behind that
-  proxy.
-- Control API: `https://relay.akdbx.link:8443/api/v1/...` (the control host
+- Public origin of a broker: `https://<id>.akdbx.link` (port 443).
+  Port 443 needs no port in the URL and works on networks that block other
+  ports. The relay must not be behind Cloudflare's proxy, which decrypts
+  traffic, so it has its own IPv4 address: port 443 on that address (and on
+  the host IPv6) is the relay's alone. The host's other IPv4 address keeps
+  Caddy on port 443 for other sites, behind Cloudflare. Earlier versions used
+  port 8443 (`https://<id>.akdbx.link:8443`); a relay can keep that port open
+  while brokers move (see "Moving the public port" in
+  [deploy/DEPLOY.md](../deploy/DEPLOY.md)).
+- Control API: `https://relay.akdbx.link/api/v1/...` (the control host
   name is configurable). It is served on the same public port: the relay
   reads the SNI name, and for the control host name it terminates TLS
   itself, with its own certificate and key. It carries no master password:
@@ -35,14 +40,14 @@ DNS (Cloudflare zone `akdbx.link`):
 
 | Name | Type | Proxy | Value |
 | --- | --- | --- | --- |
-| `akdbx.link` | A | proxied | relay host IPv4 (landing page only) |
-| `*.akdbx.link` | A / AAAA | **DNS only** | relay host IPv4 / IPv6 (broker names and `relay.akdbx.link`) |
+| `akdbx.link` | A | proxied | the host's Caddy IPv4, not the relay's (landing page only; no AAAA, because the relay owns port 443 on the IPv6 address) |
+| `*.akdbx.link` | A / AAAA | **DNS only** | the relay's own IPv4 / the host IPv6 (broker names and `relay.akdbx.link`) |
 | `_acme-challenge.<id>.akdbx.link`, `_acme-challenge.relay.akdbx.link` | TXT | DNS only | created and removed by the relay during issuance |
 
 ## Trust model: no third party in the control path
 
 Every connection to the relay, for brokers and for phones, goes straight to
-the relay host on port 8443 through DNS-only names. No proxy, CDN or tunnel
+the relay's own addresses on port 443 through DNS-only names. No proxy, CDN or tunnel
 decrypts any of it:
 
 - **Broker pages** (`<id>.akdbx.link`): TLS ends in the broker. The relay
@@ -66,9 +71,9 @@ Certificate Transparency logs make visible.
 ## Data path
 
 ```
-phone browser --TLS(SNI=<id>.akdbx.link)--> relay :8443 (reads SNI only, no decryption)
+phone browser --TLS(SNI=<id>.akdbx.link)--> relay :443 (reads SNI only, no decryption)
    relay --"open stream S" over the broker's control WebSocket--> broker
-   broker --new WebSocket wss://relay.akdbx.link:8443/api/v1/stream/S--> relay
+   broker --new WebSocket wss://relay.akdbx.link/api/v1/stream/S--> relay
    relay splices: phone TCP bytes <-> WebSocket binary frames
    broker splices: WebSocket binary frames <-> 127.0.0.1:<local-port> (the broker's own HTTPS page)
 TLS terminates only in the broker, with the broker's own key.
@@ -77,9 +82,12 @@ TLS terminates only in the broker, with the broker's own key.
 ## Protocol
 
 All JSON bodies are UTF-8. All control endpoints are HTTPS at the control
-base URL `https://relay.akdbx.link:8443`, terminated by the relay itself.
+base URL `https://relay.akdbx.link`, terminated by the relay itself.
 Brokers verify the relay's certificate as usual (a publicly trusted
-certificate for the control host name) and send `Host: relay.akdbx.link:8443`.
+certificate for the control host name) and send `Host: relay.akdbx.link`.
+On a relay with a public port other than 443, the base URL and the `Host`
+header include the port (for example `https://relay.akdbx.link:8443` and
+`Host: relay.akdbx.link:8443`).
 
 Every error response has a JSON body `{"error": "<code>", "message": "..."}`.
 When waiting can help (`429` and `503`), the body also has `"retry_after":
@@ -99,12 +107,32 @@ Request: `{"protocol": 1, "client": "akdbx/<version>"}`. `client` is optional
 (at most 64 printable characters).
 
 Response 201: `{"protocol": 1, "name": "<id>.akdbx.link", "broker_id": "<id>",
-"secret": "<43-char base64url>", "public_port": 8443}`.
+"secret": "<43-char base64url>", "public_port": 443}`.
 
 - `secret` is a bearer credential. The relay stores only its SHA-256.
+- `public_port` is the advertised public port (`AKDBX_RELAY_ADVERTISED_PORT`,
+  by default the public port). The broker's origin includes it unless it
+  is 443.
 - Errors: 429 `rate_limited` (per source IP, the TCP peer address, default
   5 registrations per day; IPv6 addresses count per /64); 503 `registrations_paused` (certificate
   budget used up, see below); 400 `unsupported_protocol`; 400 `bad_request`.
+
+### Broker: `GET /api/v1/broker`
+
+Header `Authorization: Bearer <secret>`. No body.
+
+Response 200: `{"protocol": 1, "name": "<id>.akdbx.link", "public_port": 443,
+"relay_url": "https://relay.akdbx.link"}`.
+
+- `public_port` is the current advertised public port. `relay_url` is the
+  control base URL; it has no port when `public_port` is 443, and
+  `:<public_port>` otherwise (for example `https://relay.akdbx.link:8443`).
+- A broker calls it at start, so it follows a move of the public port (for
+  example from 8443 to 443) without registering again. The response never
+  holds the secret.
+- Errors: 401 `unauthorized`; 405 for any method other than `GET`.
+- Relays from before this endpoint answer 404. A broker then keeps the
+  name, port and relay URL that it has stored.
 
 ### Certificate: `POST /api/v1/certificate`
 
@@ -183,7 +211,12 @@ stream. Text frames on a stream are a protocol error.
 - Every relay close completes within 5 s; after that the relay drops the
   TCP connection.
 
-### Public listener (:8443, raw TCP)
+### Public listener (:443, raw TCP)
+
+The main listener is `AKDBX_RELAY_PUBLIC_HOSTS` on `AKDBX_RELAY_PUBLIC_PORT`.
+Extra listeners from `AKDBX_RELAY_PUBLIC_EXTRA_LISTEN` (for example the old
+port 8443 during a move) behave in the same way and share the same limits.
+
 
 1. Read the TLS ClientHello (at most 16 KiB in at most 8 TLS records, at
    most 5 s) without consuming it, and parse the SNI host name.
@@ -247,7 +280,7 @@ accept entries whose only purpose is a rate limit. The request is deferred; the 
 
 ## Broker side (akdbx)
 
-- `akdbx relay enable [--relay https://relay.akdbx.link:8443]`: register, create an
+- `akdbx relay enable [--relay https://relay.akdbx.link]`: register, create an
   ECDSA P-256 key and CSR, get the certificate, and write a private relay
   directory (key, certificate chain, `relay.json` with name, port, secret,
   relay URL). Prints the broker's public origin and the `serve` settings. It
@@ -255,10 +288,15 @@ accept entries whose only purpose is a rate limit. The request is deferred; the 
 - `akdbx relay status`, `akdbx relay disable` (stop using it; keep or delete
   files on request).
 - `akdbx serve --relay` (or the saved setting): uses origin
-  `https://<id>.akdbx.link:8443`, the relay certificate and key for the
+  `https://<id>.akdbx.link` (with `:<port>` when the port is not 443), the
+  relay certificate and key for the
   loopback HTTPS page, a free `--local-port`, and starts the relay client:
   control WebSocket, stream WebSockets spliced to `127.0.0.1:<local-port>`,
   certificate renewal, and hot reload of the TLS context.
+- At start, the broker (akdbx 0.28.0 and later) calls `GET /api/v1/broker`.
+  When the port or relay URL has changed, it updates `relay.json` and its
+  origin, and does not register again. On a 404 from an older relay it keeps
+  the stored values.
 - The broker keeps every existing check (token, Host/Origin, 3-attempt link
   block). It trusts no header from the relay.
 - Certificate transparency check (warning only): the broker may look for
@@ -268,11 +306,20 @@ accept entries whose only purpose is a rate limit. The request is deferred; the 
 ## Relay host
 
 - Runs on the existing VPS as an unprivileged system user with its own
-  systemd unit. Public listener `0.0.0.0:8443` and `[::]:8443`, which serves
-  both the broker pages (pass-through) and the control API (relay TLS).
-  Optional health port on `127.0.0.1:8771` (plain HTTP, health only). Caddy
-  serves only the static landing page at `akdbx.link`.
-- The firewall opens 8443/tcp to everyone. Ports 80/443 stay Cloudflare-only.
+  systemd unit. Public listener on port 443 of the relay's own IPv4 address
+  and of the host IPv6 address, which serves both the broker pages
+  (pass-through) and the control API (relay TLS). During a port move, extra
+  listeners keep the old port 8443 open. Optional health port on
+  `127.0.0.1:8771` (plain HTTP, health only). Caddy listens on the host's
+  other IPv4 address and serves only the static landing page at
+  `akdbx.link`.
+- The unit grants one capability, `CAP_NET_BIND_SERVICE`, so the relay can
+  bind port 443. It does not use `PrivateUsers`: a private user namespace
+  would void that capability for the host network. Every other restriction
+  stays.
+- The firewall opens 443/tcp to everyone on the relay's own IPv4 and the
+  host IPv6, and 8443/tcp too while brokers move. Ports 80/443 on Caddy's
+  IPv4 address stay Cloudflare-only.
 - Secrets: Cloudflare API token limited to DNS edit on the `akdbx.link` zone
   (in a 0600 environment file); the ACME account key and the relay's control
   TLS key (0600 PEM files in the relay's 0700 state directory). None is in

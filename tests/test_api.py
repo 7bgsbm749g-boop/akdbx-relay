@@ -265,3 +265,42 @@ async def test_hard_limit_counts_orders_in_progress(relay_factory):
 
     results = await asyncio.gather(cert(a), cert(b))
     assert sorted(r[0] for r in results) == [200, 503]
+
+
+async def test_broker_info_needs_auth_and_reports_port(relay_factory):
+    relay = await relay_factory()
+    status, _, body = await register(relay)
+    assert status == 201
+    secret = body["secret"]
+    status, _, info = await api(relay, "GET", "/api/v1/broker", headers={"Authorization": f"Bearer {secret}"})
+    assert status == 200
+    assert info == {"protocol": 1, "name": body["name"], "public_port": relay.cfg.advertised_port,
+                    "relay_url": f"https://{relay.cfg.control_hostname}:{relay.cfg.advertised_port}"}
+    assert secret not in str(info)
+    for auth in (None, "Bearer " + "x" * 43):
+        status, _, err = await api(relay, "GET", "/api/v1/broker",
+                                   headers={"Authorization": auth} if auth else None)
+        assert status == 401 and err["error"] == "unauthorized"
+    status, _, err = await api(relay, "POST", "/api/v1/broker", {}, headers={"Authorization": f"Bearer {secret}"})
+    assert status == 405
+
+
+async def test_broker_info_url_has_no_port_for_443(relay_factory):
+    relay = await relay_factory(advertised_port=443)
+    _, _, body = await register(relay)
+    status, _, info = await api(relay, "GET", "/api/v1/broker",
+                                headers={"Authorization": f"Bearer {body['secret']}"})
+    assert status == 200 and info["public_port"] == 443
+    assert info["relay_url"] == f"https://{relay.cfg.control_hostname}"
+
+
+async def test_extra_public_listener_serves_the_same_api(relay_factory):
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        extra = s.getsockname()[1]
+    relay = await relay_factory(public_extra_listen=[("127.0.0.1", extra)])
+    from .helpers import http
+    status, _, body = await http(extra, "GET", "/api/v1/health", ssl_ctx=control_client_context(),
+                                 server_hostname=relay.cfg.control_hostname)
+    assert status == 200 and body["status"] == "ok"
