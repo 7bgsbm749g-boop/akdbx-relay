@@ -192,9 +192,10 @@ class Budget:
         expiries = [t + WEEK for t in issued] + [t + PENDING_RESERVATION for t in pending]
         return max(60, int(min(expiries) - now) + 1)
 
-    def first_issuance_retry_after(self) -> int | None:
+    def first_issuance_retry_after(self, in_flight: int = 0) -> int | None:
+        """None if a first-time certificate may be ordered now (counting orders in progress)."""
         issued = self.store.first_time_certificates()
-        if len(issued) < self.hard_limit:
+        if len(issued) + in_flight < self.hard_limit:
             return None
         return self._retry(issued, WEEK)
 

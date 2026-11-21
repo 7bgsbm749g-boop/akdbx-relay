@@ -33,7 +33,8 @@ from .wsconn import ServerWebSocket, WSClosed
 log = logging.getLogger("akdbx_relay")
 
 CONTROL_MAX_MESSAGE = 4096
-STREAM_MAX_MESSAGE = 1 << 20
+STREAM_MAX_MESSAGE = 256 * 1024
+STREAM_MAX_QUEUE = 4
 READ_CHUNK = 64 * 1024
 REGISTER_MAX_BODY = 4096
 CERTIFICATE_MAX_BODY = 64 * 1024
@@ -100,6 +101,8 @@ class Relay:
         self.conn_limiter = TokenBucket(cfg.conn_rate_per_ip, cfg.conn_burst_per_ip, clock=clock)
         self.reg_limiter = SlidingWindow(cfg.registrations_per_ip_day, DAY, clock=clock)
         self._issuing: set[str] = set()
+        self._first_time_in_flight = 0
+        self._public_writers: set[asyncio.StreamWriter] = set()
         self._issue_sem = asyncio.Semaphore(cfg.max_concurrent_issuance)
         self._servers: list[asyncio.base_events.Server] = []
         self._tasks: set[asyncio.Task] = set()
@@ -138,6 +141,9 @@ class Relay:
         for chan in list(self.controls.values()):
             with contextlib.suppress(Exception):
                 await chan.ws.close(1001, "relay shutting down")
+        for writer in list(self._public_writers):
+            with contextlib.suppress(Exception):
+                writer.close()
         for task in list(self._tasks):
             task.cancel()
         for server in self._servers:
@@ -155,6 +161,7 @@ class Relay:
 
     async def handle_public(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         reserved_for: str | None = None
+        self._public_writers.add(writer)
         try:
             peer = writer.get_extra_info("peername")
             key = rate_key(peer[0]) if peer else ""
@@ -199,6 +206,7 @@ class Relay:
         except Exception:
             log.exception("public connection error")
         finally:
+            self._public_writers.discard(writer)
             if reserved_for is not None:
                 self.total_streams -= 1
                 left = self.streams_per_broker.get(reserved_for, 1) - 1
@@ -380,11 +388,13 @@ class Relay:
             raise HTTPError(429, "rate_limited", "too many certificates for this broker this week", wait)
         first_time = not broker.has_certificate
         if first_time:
-            wait = self.budget.first_issuance_retry_after()
+            wait = self.budget.first_issuance_retry_after(self._first_time_in_flight)
             if wait is not None:
                 raise HTTPError(503, "issuance_paused",
                                 "the relay's weekly certificate budget is used up", wait)
         self._issuing.add(broker.id)
+        if first_time:
+            self._first_time_in_flight += 1
         try:
             try:
                 await asyncio.wait_for(self._issue_sem.acquire(), ISSUANCE_QUEUE_TIMEOUT)
@@ -403,6 +413,8 @@ class Relay:
             raise HTTPError(502, "acme_failed", "the certificate authority did not issue a certificate") from None
         finally:
             self._issuing.discard(broker.id)
+            if first_time:
+                self._first_time_in_flight -= 1
         not_after = leaf_not_after(chain)
         first = self.store.record_certificate(broker.id, not_after.timestamp())
         log.info("issued a %s certificate", "first" if first else "renewal")
@@ -488,7 +500,8 @@ class Relay:
         if not req.is_websocket:
             raise HTTPError(400, "websocket_required", "this endpoint needs a WebSocket upgrade")
         del self.pending[stream_id]  # single use
-        ws = await ServerWebSocket.accept(req.reader, req.writer, req.raw_head, STREAM_MAX_MESSAGE)
+        ws = await ServerWebSocket.accept(req.reader, req.writer, req.raw_head, STREAM_MAX_MESSAGE,
+                                          STREAM_MAX_QUEUE)
         if ws is None:
             return None
         if pending.future.done():

@@ -248,3 +248,25 @@ async def test_slow_or_bad_http_heads(relay_factory):
     data = await asyncio.wait_for(reader.read(), 5)
     assert b" 400 " in data.split(b"\r\n")[0]
     writer.close()
+
+
+async def test_hard_limit_counts_orders_in_progress(relay_factory):
+    import asyncio
+
+    class SlowIssuer(FakeIssuer):
+        async def issue(self, name, csr_pem_bytes):
+            await asyncio.sleep(0.3)
+            return await super().issue(name, csr_pem_bytes)
+
+    relay = await relay_factory(SlowIssuer(), cert_budget=1, cert_hard_limit=1)
+    _, _, a = await register(relay)
+    relay.cfg.cert_budget = 5  # let the second registration through
+    relay.budget.budget = 5
+    _, _, b = await register(relay)
+
+    async def cert(reg):
+        return await http(relay.control_port, "POST", "/api/v1/certificate",
+                          {"csr": csr_pem(make_csr(reg["name"]))}, {"Authorization": f"Bearer {reg['secret']}"})
+
+    results = await asyncio.gather(cert(a), cert(b))
+    assert sorted(r[0] for r in results) == [200, 503]

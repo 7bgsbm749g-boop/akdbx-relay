@@ -121,7 +121,7 @@ stream. Text frames on a stream are a protocol error.
 
 - The first binary frame from the relay is the buffered ClientHello, byte for
   byte.
-- Binary messages are at most 1 MiB.
+- Binary messages are at most 256 KiB (a TLS record is at most about 16 KiB).
 - The relay also sends WebSocket ping frames every 30 s so that proxies keep
   idle streams open; standard WebSocket clients answer them automatically.
 - Errors before the upgrade: 401 `unauthorized`; 404 `unknown_stream`

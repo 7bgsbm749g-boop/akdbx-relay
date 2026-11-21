@@ -197,13 +197,15 @@ class ServerWebSocket:
         if self.protocol.state is State.OPEN:
             self.protocol.send_close(code, reason)
             await self._flush()
-        if self._reader_task is not None and not self._reader_task.done():
-            self._space.set()
-            try:
-                await asyncio.wait_for(asyncio.shield(self._reader_task), 5)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                self._reader_task.cancel()
-        await self._close_transport()
+        try:
+            if self._reader_task is not None and not self._reader_task.done():
+                self._space.set()
+                # asyncio.wait does not raise if the reader task failed or was cancelled.
+                await asyncio.wait({self._reader_task}, timeout=5)
+                if not self._reader_task.done():
+                    self._reader_task.cancel()
+        finally:
+            await self._close_transport()
 
     async def wait_closed(self) -> None:
         await self._done.wait()
