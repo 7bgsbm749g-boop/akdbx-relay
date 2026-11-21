@@ -138,29 +138,36 @@ the weekly budget.
 A relay that ran on port 8443 moves to port 443 without breaking existing
 brokers:
 
-1. Make sure the host has a second IPv4 address for the relay, point the
-   `*.akdbx.link` A record to it, and open the firewall as in section 2
-   (443 and 8443).
+1. Make sure the host has a second IPv4 address for the relay (192.0.2.10
+   here; 192.0.2.20 is the old one), and open the firewall as in section 2
+   (443 and 8443). Do not change DNS yet.
 2. In `relay.env`, set `AKDBX_RELAY_PUBLIC_HOSTS` to the relay's own
-   addresses, `AKDBX_RELAY_PUBLIC_PORT=443`, and keep the old port with
-   extra listeners:
+   addresses, `AKDBX_RELAY_PUBLIC_PORT=443`, and keep port 8443 on both
+   IPv4 addresses and the IPv6 address with extra listeners, so clients that
+   still have the old A record keep working:
 
    ```sh
    AKDBX_RELAY_PUBLIC_HOSTS=192.0.2.10,2001:db8::10
    AKDBX_RELAY_PUBLIC_PORT=443
-   AKDBX_RELAY_PUBLIC_EXTRA_LISTEN=192.0.2.10:8443,[2001:db8::10]:8443
+   AKDBX_RELAY_PUBLIC_EXTRA_LISTEN=192.0.2.10:8443,192.0.2.20:8443,[2001:db8::10]:8443
    ```
 
-3. Update the unit and restart: `sudo deploy/setup.sh --start`. Check
+3. Update the unit and restart: `sudo deploy/setup.sh --start`. Check the new
+   address before DNS points to it:
+   `curl -s --resolve relay.akdbx.link:443:192.0.2.10 https://relay.akdbx.link/api/v1/health`
+   and the same for `:8443` on both IPv4 addresses.
+4. Point the `*.akdbx.link` A record to the new address. Check
    `curl -s https://relay.akdbx.link/api/v1/health` and
    `curl -s https://relay.akdbx.link:8443/api/v1/health`.
-4. Brokers (akdbx 0.28.0 and later) call `GET /api/v1/broker` at their next
+5. Brokers (akdbx 0.28.0 and later) call `GET /api/v1/broker` at their next
    start and move to `https://<id>.akdbx.link` without registering again.
    Older brokers keep using port 8443 until they update.
-5. When the old port is no longer needed, remove
-   `AKDBX_RELAY_PUBLIC_EXTRA_LISTEN`, restart, and close `8443/tcp`.
-   A broker that still uses port 8443 then cannot reach the relay; set it
-   up again with `akdbx relay enable`.
+6. Remove the old-address listener only after the old A record has expired
+   from caches (wait at least its TTL). When port 8443 is no longer needed,
+   remove `AKDBX_RELAY_PUBLIC_EXTRA_LISTEN`, restart, and close `8443/tcp`.
+   A 0.28.0 broker that still has port 8443 saved then asks the default URL
+   `https://relay.akdbx.link` on the same host at its next start, or with
+   `akdbx relay enable`.
 
 ## Operations
 
