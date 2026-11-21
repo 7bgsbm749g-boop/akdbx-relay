@@ -9,7 +9,7 @@ description = "Relay that forwards encrypted TLS connections to akdbx brokers wi
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "websockets>=13.0,<18",
+    "websockets>=13.1,<18",
     "cryptography>=42,<51",
     "acme>=2.10,<6",
     "josepy>=1.14,<3",
