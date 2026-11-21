@@ -1,0 +1,88 @@
+# Deploying the akdbx relay
+
+This is the plan for one Linux host with systemd, Caddy and a Cloudflare zone
+for `akdbx.link`. Nothing in this repository changes a live host by itself.
+
+## 1. Cloudflare
+
+1. DNS records in the `akdbx.link` zone:
+
+   | Name | Type | Proxy | Value |
+   | --- | --- | --- | --- |
+   | `akdbx.link` | A (and AAAA if the host has IPv6) | proxied | host address |
+   | `*.akdbx.link` | A (and AAAA) | **DNS only** | host address |
+
+   The wildcard must stay DNS only: if Cloudflare proxied it, Cloudflare
+   would terminate TLS for broker names, and the relay's design would fail.
+2. API token: My Profile > API Tokens > Create Token > "Edit zone DNS"
+   template, with Zone Resources limited to `akdbx.link`. The relay needs
+   only DNS edit on this one zone.
+3. Copy the zone id from the zone's overview page.
+
+## 2. Firewall
+
+Open `8443/tcp` to everyone (IPv4 and IPv6). Leave ports 80/443 as they are
+(Cloudflare only). The relay trusts the `CF-Connecting-IP` header only from
+the local Caddy, so 443 must not be reachable except through Cloudflare.
+
+## 3. Install
+
+From a checkout of this repository on the host:
+
+```sh
+sudo deploy/setup.sh
+sudoedit /etc/akdbx-relay/relay.env    # token, zone id; keep ACME_DIRECTORY=staging first
+sudo deploy/setup.sh --start
+curl -s http://127.0.0.1:8771/api/v1/health
+```
+
+`setup.sh` creates the `akdbx-relay` system user, a virtual environment in
+`/opt/akdbx-relay/venv`, `/etc/akdbx-relay/relay.env` (0600, root, only if it
+does not exist), the landing page in `/var/www/akdbx.link`, and the systemd
+unit. The relay creates its ACME account key and SQLite state in
+`/var/lib/akdbx-relay` (0700) at first use.
+
+## 4. Caddy
+
+1. Back up the Caddyfile.
+2. Append `deploy/Caddyfile.akdbx-relay` and set its `bind` line like the
+   other site blocks on the host.
+3. `sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile`,
+   then `sudo systemctl reload caddy`.
+4. If Caddy needs a first certificate for `akdbx.link` while the record is
+   proxied and 80/443 are Cloudflare only, follow the host's normal procedure
+   for a new site (for example, DNS only until Caddy has the certificate).
+
+Check: `https://akdbx.link/` shows the landing page and
+`https://akdbx.link/api/v1/health` returns `{"status":"ok",...}`.
+
+## 5. Smoke test (staging certificates)
+
+On any computer:
+
+```sh
+python -m akdbx_relay.testclient --relay https://akdbx.link --state ./relay-test.json demo
+```
+
+It registers, gets a certificate, and prints `https://<id>.akdbx.link:8443/`.
+With staging, browsers warn about the untrusted staging CA; `curl -k` shows
+the page. When it works, set `AKDBX_RELAY_ACME_DIRECTORY=production`, restart
+(`sudo systemctl restart akdbx-relay`), and test again with a new state file.
+Each first-time certificate counts against the weekly budget.
+
+## Operations
+
+- Logs: `journalctl -u akdbx-relay`. They contain no client IPs, secrets,
+  CSRs or relayed bytes.
+- Update: `git pull` in the checkout, then `sudo deploy/setup.sh --start`.
+- Backup: `/var/lib/akdbx-relay/relay.sqlite3` (broker list, secret hashes,
+  certificate log) and `acme-account.pem`. Without the database, every broker
+  must register again.
+- Cloudflare closes an origin request after 100 seconds. Certificate requests
+  normally take 15 to 40 seconds (`AKDBX_RELAY_DNS_PROPAGATION_SECONDS` plus
+  ACME validation), so keep `AKDBX_RELAY_ACME_TIMEOUT` under about 70.
+- Let's Encrypt limits: about 50 new certificates per registered domain each
+  week. The relay pauses new registrations at `AKDBX_RELAY_CERT_BUDGET`
+  (default 40). Renewals continue. To grow, request a higher limit with
+  Let's Encrypt's rate-limit form and consider the Public Suffix List entry
+  described in [PROTOCOL.md](../docs/PROTOCOL.md).

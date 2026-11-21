@@ -1,0 +1,39 @@
+# Caddy site for the akdbx relay's control API and landing page.
+#
+# akdbx.link is proxied by Cloudflare (orange cloud). The broker hostnames
+# (*.akdbx.link) are DNS only and go straight to the relay on port 8443;
+# Caddy never sees them.
+#
+# Append this block to the Caddyfile (back it up first), set the bind
+# address to the host's public IPv4 like the other site blocks, validate,
+# then reload. See deploy/DEPLOY.md.
+
+akdbx.link {
+	# bind <public IPv4 of the relay host>
+
+	# Control API: register, certificate, and the WebSocket channels.
+	# Caddy's reverse_proxy passes WebSocket upgrades through. The relay reads
+	# Cloudflare's CF-Connecting-IP header only because the TCP peer is
+	# 127.0.0.1 (this proxy) and ports 80/443 accept only Cloudflare.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8771 {
+			flush_interval -1
+		}
+	}
+
+	# Small static landing page.
+	handle {
+		root * /var/www/akdbx.link
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; frame-ancestors 'none'"
+		-Server
+	}
+
+	# No "log" directive: Caddy keeps no access log, so no client IPs are written.
+}

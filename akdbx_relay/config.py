@@ -60,8 +60,8 @@ class Config:
     acme_account_key_file: str = "/var/lib/akdbx-relay/acme-account.pem"
     acme_email: str = ""
     acme_ca_bundle: str = ""
-    acme_timeout: float = 180.0
-    dns_propagation_seconds: float = 15.0
+    acme_timeout: float = 60.0
+    dns_propagation_seconds: float = 10.0
     cloudflare_api: str = CLOUDFLARE_API
     cloudflare_token: str = field(default="", repr=False)
     cloudflare_zone_id: str = ""
