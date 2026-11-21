@@ -154,6 +154,7 @@ class Relay:
         self._public_writers: set[asyncio.StreamWriter] = set()
         self._issue_sem = asyncio.Semaphore(cfg.max_concurrent_issuance)
         self._public_server: asyncio.base_events.Server | None = None
+        self._extra_servers: list[asyncio.base_events.Server] = []
         self._health_server: asyncio.base_events.Server | None = None
         self._tasks: set[asyncio.Task] = set()
         self.http = HTTPServer(self.route)
@@ -175,6 +176,10 @@ class Relay:
         self._public_server = await asyncio.start_server(
             self.handle_public, self.cfg.public_hosts, self.cfg.public_port, backlog=1024
         )
+        for host, port in self.cfg.public_extra_listen:
+            self._extra_servers.append(
+                await asyncio.start_server(self.handle_public, host, port, backlog=1024)
+            )
         self._spawn(self.control_tls.run())
         log.info(
             "akdbx relay %s listening: public %s port %d (control API at https://%s:%d), health %s",
@@ -182,6 +187,9 @@ class Relay:
             self.cfg.control_hostname, self.cfg.advertised_port,
             f"{self.cfg.health_host} port {self.health_port}" if self._health_server else "off",
         )
+        if self._extra_servers:
+            log.info("also listening on %s", ", ".join(
+                f"[{h}]:{p}" if ":" in h else f"{h}:{p}" for h, p in self.cfg.public_extra_listen))
 
     @property
     def health_port(self) -> int:
@@ -194,7 +202,8 @@ class Relay:
         return self._public_server.sockets[0].getsockname()[1]
 
     async def stop(self) -> None:
-        servers = [srv for srv in (self._public_server, self._health_server) if srv is not None]
+        servers = [srv for srv in (self._public_server, self._health_server, *self._extra_servers)
+                   if srv is not None]
         for server in servers:
             server.close()
         await asyncio.gather(
@@ -209,6 +218,7 @@ class Relay:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(server.wait_closed(), 5)
         self._public_server = self._health_server = None
+        self._extra_servers = []
 
     async def _recheck_txt_markers(self, delay: float) -> None:
         """Reconcile start-up TXT markers again once their orders cannot still create a record."""
@@ -532,6 +542,8 @@ class Relay:
             return (self.api_register, REGISTER_MAX_BODY) if method == "POST" else (self._method_not_allowed, 0)
         if path == "/api/v1/certificate":
             return (self.api_certificate, CERTIFICATE_MAX_BODY) if method == "POST" else (self._method_not_allowed, 0)
+        if path == "/api/v1/broker":
+            return (self.api_broker, 0) if method == "GET" else (self._method_not_allowed, 0)
         if path == "/api/v1/connect":
             return (self.api_connect, 0) if method == "GET" else (self._method_not_allowed, 0)
         if path.startswith("/api/v1/stream/"):
@@ -596,6 +608,26 @@ class Relay:
             "broker_id": broker_id,
             "secret": secret,
             "public_port": self.cfg.advertised_port,
+        })
+
+    @property
+    def relay_url(self) -> str:
+        """The control API URL that brokers should use (no port for 443)."""
+        port = self.cfg.advertised_port
+        return f"https://{self.cfg.control_hostname}" + ("" if port == 443 else f":{port}")
+
+    async def api_broker(self, req: Request) -> Response:
+        """Tell a registered broker its name and the current public port and control URL.
+
+        A broker calls this at start, so it follows a move of the public port
+        (for example from 8443 to 443) without registering again.
+        """
+        broker = self.authenticate(req)
+        return Response(200, {
+            "protocol": PROTOCOL_VERSION,
+            "name": self.fqdn(broker.id),
+            "public_port": self.cfg.advertised_port,
+            "relay_url": self.relay_url,
         })
 
     async def api_certificate(self, req: Request) -> Response:

@@ -5,7 +5,7 @@
 #   sudo deploy/setup.sh --start    also enable and (re)start the service
 #
 # It does not change Caddy, DNS or the firewall. See deploy/DEPLOY.md.
-# The control API is served by the relay itself on port 8443 for
+# The control API is served by the relay itself on port 443 for
 # relay.akdbx.link (DNS only); Caddy serves only the landing page.
 set -euo pipefail
 
