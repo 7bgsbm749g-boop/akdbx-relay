@@ -251,7 +251,7 @@ async def test_stream_idle_timeout(relay_factory):
 
 
 async def test_per_broker_and_global_stream_caps(relay_factory):
-    relay = await relay_factory(max_streams_per_broker=2, max_streams_total=3, stream_open_timeout=5)
+    relay = await relay_factory(max_streams_per_broker=2, max_streams_total=3, stream_open_timeout=1.5)
     url = f"http://127.0.0.1:{relay.control_port}"
     a = await register(url)
     b = await register(url)
