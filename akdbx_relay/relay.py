@@ -496,6 +496,11 @@ class Relay:
             return None
         session = StreamSession(ws)
         pending.future.set_result(session)
-        await session.done.wait()
+        waiters = [asyncio.create_task(session.done.wait()), asyncio.create_task(ws.wait_closed())]
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
         await ws.wait_closed()
         return None
