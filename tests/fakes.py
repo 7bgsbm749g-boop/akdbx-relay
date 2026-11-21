@@ -103,6 +103,7 @@ class FakeCloudflare(_Base):
         self.deleted: list[str] = []
         self.fail_delete = False
         self.create_delay = 0.0  # seconds before a create answers (after the record exists)
+        self.delete_delay = 0.0  # seconds before a delete takes effect and answers
         self.list_calls = 0
         super().__init__()
 
@@ -156,6 +157,8 @@ class FakeCloudflare(_Base):
             return self.send(h, 200, {"success": True, "result": {"id": rid}})
         if method == "DELETE" and h.path.startswith(prefix + "/"):
             rid = h.path[len(prefix) + 1:]
+            if self.delete_delay:
+                time.sleep(self.delete_delay)
             if self.fail_delete:
                 return self.send(h, 500, {"success": False, "errors": [{"code": 1}]})
             with self.lock:
@@ -180,6 +183,7 @@ class FakeACME(_Base):
         self.certs: dict[str, str] = {}
         self.rate_limited = False
         self.fail_validation = False
+        self.chall_delay = 0.0  # seconds before a challenge answer is processed
         self.new_account_calls = 0
         self.seen_payloads: list[bytes] = []
         super().__init__()
@@ -265,6 +269,8 @@ class FakeACME(_Base):
         if kind == "authz":
             return self.send(h, 200, self._authz(ident), n)
         if kind == "chall":
+            if self.chall_delay:
+                time.sleep(self.chall_delay)
             ch = self.challs[ident]
             authz = self.authzs[ch["_authz"]]
             name = "_acme-challenge." + authz["identifier"]["value"]

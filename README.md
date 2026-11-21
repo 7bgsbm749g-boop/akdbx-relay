@@ -123,8 +123,10 @@ environment take precedence. Never commit a filled-in file.
 | `AKDBX_RELAY_MAX_STREAMS_PER_IP` | `16` | Concurrent phone-side streams per IP, held for the connection's life. |
 | `AKDBX_RELAY_MAX_CONTROL_CONNECTIONS` | `4096` | Concurrent control API connections (control channels and stream WebSockets). |
 | `AKDBX_RELAY_MAX_CONTROL_CONNECTIONS_PER_IP` | `96` | Of those, per IP. |
-| `AKDBX_RELAY_CONN_RATE_PER_IP` | `10` | New connections to the public port per second per IP (IPv6: per /64), brokers' control and stream connections included. |
+| `AKDBX_RELAY_CONN_RATE_PER_IP` | `10` | New connections to broker names on the public port (phones and browsers) per second per IP (IPv6: per /64). |
 | `AKDBX_RELAY_CONN_BURST_PER_IP` | `20` | Burst allowance for the connection rate. |
+| `AKDBX_RELAY_CONTROL_CONN_RATE_PER_IP` | `20` | New connections to the control host name (brokers' control and stream connections) per second per IP, in a separate bucket. |
+| `AKDBX_RELAY_CONTROL_CONN_BURST_PER_IP` | `96` | Burst allowance for the control connection rate. Keep it above `AKDBX_RELAY_MAX_STREAMS_PER_BROKER`, so a broker can open all its streams at once. |
 | `AKDBX_RELAY_CLIENT_HELLO_TIMEOUT` | `5` | Seconds to receive the ClientHello. |
 | `AKDBX_RELAY_CLIENT_HELLO_MAX_BYTES` | `16384` | Largest ClientHello buffered. |
 | `AKDBX_RELAY_STREAM_OPEN_TIMEOUT` | `10` | Seconds to announce a stream on the control channel and for the broker to open it. |

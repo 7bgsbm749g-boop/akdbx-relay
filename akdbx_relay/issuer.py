@@ -11,6 +11,7 @@ import asyncio
 import datetime
 import logging
 import os
+import time
 
 import josepy as jose
 from acme import challenges, client, errors, messages
@@ -88,6 +89,9 @@ class ACMEIssuer:
         self.dns = dns
         self._key: jose.JWKRSA | None = None
         self._account_lock = asyncio.Lock()
+        # Start-up markers kept for one more check (see cleanup_stale_records).
+        self._recheck_ids: set[int] = set()
+        self._background: set[asyncio.Task] = set()
 
     @property
     def _meta_key(self) -> str:
@@ -134,7 +138,11 @@ class ACMEIssuer:
             log.info("registered the ACME account")
             return uri
 
-    async def cleanup_stale_records(self) -> None:
+    @property
+    def _stale_window(self) -> float:
+        return STALE_RECORD_AGE_FACTOR * self.cfg.certificate_deadline
+
+    async def cleanup_stale_records(self) -> float | None:
         """Remove TXT records left behind by a crash or a cancelled order.
 
         Two passes: every cleanup marker in the store (a marker is written
@@ -142,19 +150,30 @@ class ACMEIssuer:
         is still found by name and value), then every relay-owned
         ``_acme-challenge`` record in the zone that is older than any order
         could be. At start-up no order of this relay is running.
+
+        A marker without a record id whose record is not there yet, and that
+        is younger than the stale window, may belong to a create call that
+        still lands. It is kept, and the return value is the number of
+        seconds after which recheck_markers() must run; otherwise None.
         """
+        now = time.time()
+        recheck_at: float | None = None
         for marker in self.store.txt_markers():
+            keep_until = marker.created_at + self._stale_window
             try:
-                await self._remove_marked(marker)
+                removed = await self._remove_marked(marker, keep_if_absent=keep_until > now)
             except Exception as exc:
                 log.warning("could not remove a stale ACME TXT record: %s", exc)
+                continue
+            if not removed:
+                self._recheck_ids.add(marker.id)
+                recheck_at = keep_until if recheck_at is None else max(recheck_at, keep_until)
         try:
             records = await self.dns.list_txt()
         except Exception as exc:
             log.warning("could not list ACME TXT records: %s", exc)
-            return
-        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-            seconds=STALE_RECORD_AGE_FACTOR * self.cfg.certificate_deadline)
+            records = []
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=self._stale_window)
         suffix = "." + self.cfg.domain
         for rec in records:
             name = rec.name.lower().rstrip(".")
@@ -168,17 +187,47 @@ class ACMEIssuer:
                 log.info("removed a stale relay-owned ACME TXT record")
             except Exception as exc:
                 log.warning("could not remove a stale ACME TXT record: %s", exc)
+        if recheck_at is None:
+            return None
+        return max(0.0, recheck_at - time.time()) + 1.0
 
-    async def _remove_marked(self, marker: TxtMarker) -> None:
-        """Delete the record a marker describes, then the marker."""
+    async def recheck_markers(self) -> None:
+        """Second look at the start-up markers that cleanup_stale_records kept."""
+        ids, self._recheck_ids = self._recheck_ids, set()
+        for marker in self.store.txt_markers():
+            if marker.id not in ids:
+                continue  # an order of this process
+            try:
+                await self._remove_marked(marker)
+            except Exception as exc:
+                log.warning("could not remove a stale ACME TXT record: %s", exc)
+
+    async def _remove_marked(self, marker: TxtMarker, keep_if_absent: bool = False) -> bool:
+        """Delete the record a marker describes, then the marker.
+
+        Returns False, and keeps the marker, when `keep_if_absent` is set and
+        no record was found for a marker without a record id.
+        """
         if marker.record_id:
             await self.dns.delete_txt(marker.record_id)
         elif marker.name:
             # The create call may or may not have reached Cloudflare.
+            found = False
             for rec in await self.dns.list_txt(marker.name):
                 if rec.content.strip('"') == marker.content and rec.comment == RECORD_COMMENT:
                     await self.dns.delete_txt(rec.id)
+                    found = True
+            if not found and keep_if_absent:
+                return False
         self.store.remove_txt_marker(marker.id)
+        return True
+
+    async def _remove_in_background(self, marker: TxtMarker) -> None:
+        try:
+            await self._remove_marked(marker)
+        except Exception as exc:
+            # The marker stays in the store; the record is removed at the next start.
+            log.warning("could not remove an ACME TXT record: %s", exc)
 
     async def issue(self, name: str, csr_pem: bytes, deadline: float | None = None) -> str:
         """Run one ACME order for `name`. Returns the PEM chain, leaf first.
@@ -258,9 +307,19 @@ class ACMEIssuer:
             poll_deadline = datetime.datetime.now() + datetime.timedelta(seconds=wait)
             orderr = await asyncio.to_thread(acme.poll_and_finalize, orderr, poll_deadline)
         finally:
+            task = asyncio.current_task()
+            cancelling = task is not None and task.cancelling() > 0
             for marker in markers:
                 if marker.id in unsure:
                     continue  # the next start removes it
+                if cancelling:
+                    # The request deadline (or shutdown) is cancelling the
+                    # order: answer now, delete in the background. The marker
+                    # stays until the delete succeeds.
+                    bg = asyncio.create_task(self._remove_in_background(marker))
+                    self._background.add(bg)
+                    bg.add_done_callback(self._background.discard)
+                    continue
                 try:
                     await self._remove_marked(marker)
                 except asyncio.CancelledError:

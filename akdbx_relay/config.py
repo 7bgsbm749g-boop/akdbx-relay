@@ -109,6 +109,11 @@ class Config:
     max_control_connections_per_ip: int = 96
     conn_rate_per_ip: float = 10.0
     conn_burst_per_ip: int = 20
+    # New connections to the control host name per address (brokers' control
+    # and stream WebSockets). The burst lets one broker open
+    # max_streams_per_broker streams at once.
+    control_conn_rate_per_ip: float = 20.0
+    control_conn_burst_per_ip: int = 96
     client_hello_timeout: float = 5.0
     client_hello_max_bytes: int = 16384
     stream_open_timeout: float = 10.0
@@ -169,6 +174,8 @@ class Config:
                                                 d.max_control_connections_per_ip, 2),
             conn_rate_per_ip=_float(env, "CONN_RATE_PER_IP", d.conn_rate_per_ip, 0.1),
             conn_burst_per_ip=_int(env, "CONN_BURST_PER_IP", d.conn_burst_per_ip, 1),
+            control_conn_rate_per_ip=_float(env, "CONTROL_CONN_RATE_PER_IP", d.control_conn_rate_per_ip, 0.1),
+            control_conn_burst_per_ip=_int(env, "CONTROL_CONN_BURST_PER_IP", d.control_conn_burst_per_ip, 1),
             client_hello_timeout=_float(env, "CLIENT_HELLO_TIMEOUT", d.client_hello_timeout, 0.1),
             client_hello_max_bytes=_int(env, "CLIENT_HELLO_MAX_BYTES", d.client_hello_max_bytes, 512),
             stream_open_timeout=_float(env, "STREAM_OPEN_TIMEOUT", d.stream_open_timeout, 0.1),

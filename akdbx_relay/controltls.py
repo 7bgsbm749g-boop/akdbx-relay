@@ -20,6 +20,7 @@ import datetime
 import logging
 import os
 import ssl
+import tempfile
 from typing import Awaitable, Callable
 
 from cryptography import x509
@@ -80,11 +81,16 @@ def name_matches(cert: x509.Certificate, hostname: str) -> bool:
 
 
 def write_private(path: str, data: bytes) -> None:
-    """Write a 0600 file atomically (temporary file, then rename)."""
+    """Write a 0600 file atomically.
+
+    The data goes to a new private temporary file in the same directory,
+    which is fsynced and then renamed over `path`; a crash leaves either the
+    old file or the complete new one, never a partial file at `path`.
+    """
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, mode=0o700, exist_ok=True)
-    tmp = f"{path}.tmp-{os.getpid()}"
-    fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    # mkstemp creates the file with mode 0600 and O_EXCL.
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=parent)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
@@ -97,6 +103,16 @@ def write_private(path: str, data: bytes) -> None:
         except OSError:
             pass
         raise
+    try:
+        dir_fd = os.open(parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)  # make the rename itself durable
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def load_or_create_key(path: str) -> ec.EllipticCurvePrivateKey:
@@ -110,11 +126,7 @@ def load_or_create_key(path: str) -> ec.EllipticCurvePrivateKey:
     pem = key.private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
     )
-    parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, mode=0o700, exist_ok=True)
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(pem)
+    write_private(path, pem)
     log.info("created a new control TLS key")
     return key
 

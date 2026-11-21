@@ -49,6 +49,13 @@ class TokenBucket:
         self._buckets[key] = (tokens - 1.0, now)
         return True
 
+    def refund(self, key: str) -> None:
+        """Give back one token taken by allow()."""
+        entry = self._buckets.get(key)
+        if entry is not None:
+            tokens, stamp = entry
+            self._buckets[key] = (min(self.burst, tokens + 1.0), stamp)
+
     def _sweep(self, now: float, force: bool = False) -> None:
         if not force and now - self._last_sweep < 60:
             return

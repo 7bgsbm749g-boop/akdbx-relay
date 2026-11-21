@@ -58,6 +58,7 @@ class TxtMarker:
     name: str
     content: str
     record_id: str | None
+    created_at: float = 0.0  # store clock (wall time)
 
 
 @dataclass(frozen=True)
@@ -127,14 +128,23 @@ class Store:
     # Certificate log and budget
 
     def record_certificate(self, broker_id: str, not_after: float) -> bool:
-        """Log an issued certificate. Returns True if it was the broker's first."""
+        """Log an issued certificate. Returns True if it was the broker's first.
+
+        An id with no broker row (the relay's own control certificate) is a
+        first certificate when the log has no earlier one for that id.
+        """
         now = self.clock()
         self.db.execute("BEGIN IMMEDIATE")
         try:
             row = self.db.execute(
                 "SELECT has_certificate FROM brokers WHERE id = ?", (broker_id,)
             ).fetchone()
-            first = not (row and row[0])
+            if row is not None:
+                first = not row[0]
+            else:
+                first = self.db.execute(
+                    "SELECT 1 FROM certificates WHERE broker_id = ? LIMIT 1", (broker_id,)
+                ).fetchone() is None
             self.db.execute(
                 "INSERT INTO certificates (broker_id, issued_at, not_after, first_time) VALUES (?, ?, ?, ?)",
                 (broker_id, now, not_after, 1 if first else 0),
@@ -176,11 +186,12 @@ class Store:
     # record is created and removed after the record is deleted.
 
     def add_txt_marker(self, name: str, content: str) -> TxtMarker:
+        now = self.clock()
         cur = self.db.execute(
             "INSERT INTO acme_txt_markers (name, content, record_id, created_at) VALUES (?, ?, NULL, ?)",
-            (name, content, self.clock()),
+            (name, content, now),
         )
-        return TxtMarker(int(cur.lastrowid), name, content, None)
+        return TxtMarker(int(cur.lastrowid), name, content, None, now)
 
     def set_txt_marker_record(self, marker_id: int, record_id: str) -> None:
         self.db.execute("UPDATE acme_txt_markers SET record_id = ? WHERE id = ?", (record_id, marker_id))
@@ -190,9 +201,9 @@ class Store:
 
     def txt_markers(self) -> list[TxtMarker]:
         rows = self.db.execute(
-            "SELECT id, name, content, record_id FROM acme_txt_markers ORDER BY id"
+            "SELECT id, name, content, record_id, created_at FROM acme_txt_markers ORDER BY id"
         ).fetchall()
-        return [TxtMarker(r[0], r[1], r[2], r[3]) for r in rows]
+        return [TxtMarker(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
     # Meta
 

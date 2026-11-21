@@ -95,7 +95,7 @@ async def teardown(client, task, server):
 
 async def test_end_to_end_https_through_relay(relay_factory, ca, tmp_path):
     # Phones and the broker's stream connections all come from 127.0.0.1 and
-    # share the per-address limits on :8443; this test opens ~30 at once.
+    # share the per-address handshake limit on :8443; this test opens ~30 at once.
     relay = await relay_factory(conn_burst_per_ip=100, max_handshakes_per_ip=32)
     reg, client, task, server, seen = await setup_broker(relay, ca, tmp_path)
     try:
@@ -283,16 +283,18 @@ async def test_per_broker_and_global_stream_caps(relay_factory):
 
 
 async def test_connection_rate_limit_per_ip(relay_factory):
-    relay = await relay_factory(conn_rate_per_ip=0.1, conn_burst_per_ip=2, client_hello_timeout=5)
+    # Before its ClientHello a connection takes a token from either bucket.
+    relay = await relay_factory(conn_rate_per_ip=0.1, conn_burst_per_ip=2, client_hello_timeout=5,
+                                control_conn_rate_per_ip=0.1, control_conn_burst_per_ip=1)
     opened = []
-    for _ in range(2):
+    for _ in range(3):
         r, w = await asyncio.open_connection("127.0.0.1", relay.public_port)
         opened.append((r, w))
     await asyncio.sleep(0.05)
-    # The third connection is closed at once, before any ClientHello.
+    # The fourth connection is closed at once, before any ClientHello.
     r, w = await asyncio.open_connection("127.0.0.1", relay.public_port)
     assert await asyncio.wait_for(r.read(), 1) == b""
-    assert relay.pending_handshakes == 2
+    assert relay.pending_handshakes == 3
     for _, wr in opened:
         wr.close()
 

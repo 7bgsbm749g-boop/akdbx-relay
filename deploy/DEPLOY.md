@@ -131,8 +131,11 @@ the weekly budget.
   ACME account key), and `control-key.pem` with `control-chain.pem` (the
   relay's own control TLS key and certificate). Without the database, every
   broker must register again. Without the control key, the relay orders a
-  new control certificate at start, which counts once against the weekly
-  certificate budget.
+  new control certificate at start.
+- The relay records each control certificate order in its certificate log,
+  like a broker's: the first one counts once against the weekly budget
+  (`AKDBX_RELAY_CERT_BUDGET` and `AKDBX_RELAY_CERT_HARD_LIMIT`), and later
+  orders for the same name are renewals that do not.
 - Certificate requests normally take 15 to 40 seconds
   (`AKDBX_RELAY_DNS_PROPAGATION_SECONDS` plus ACME validation). The relay
   answers each one within `AKDBX_RELAY_CERTIFICATE_DEADLINE` (default 90 s),

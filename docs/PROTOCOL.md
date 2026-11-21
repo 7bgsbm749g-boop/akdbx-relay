@@ -194,16 +194,28 @@ stream. Text frames on a stream are a protocol error.
    relay has no certificate for that name).
 4. Send `open` on the control channel and wait for the stream WebSocket,
    both within 10 s; replay the buffered ClientHello bytes, then splice.
+5. When the stream ends normally (the phone closed, or the broker closed the
+   stream WebSocket with 1000 or 1001), the relay keeps
+   sending the last bytes to the phone while they keep moving, and drops the
+   connection only when nothing is sent for the stream idle timeout (5
+   minutes). Errors and shutdown drop the connection after at most 2 s.
 
 Limits (defaults, configurable). "Per source IP" means per IPv4 address or
-per IPv6 /64, by TCP peer address; it counts all connections to port 8443
-from that address, including a broker's own control and stream connections:
+per IPv6 /64, by TCP peer address:
 
-- 10 new connections per second per source IP (burst 20);
+- 10 new connections per second per source IP (burst 20) to broker names
+  (phones and browsers), and a separate 20 per second (burst 96) to the
+  control host name (brokers' control and stream connections), so a broker
+  can open its 64 streams at once and a broker and a browser behind one
+  address do not share a bucket. Before its ClientHello a connection takes a
+  token from the first bucket, or from the second when the first is empty;
+  after the SNI is read, the token moves to the bucket for that name;
 - 1024 connections still sending their ClientHello, at most 8 per source IP;
 - 64 concurrent streams per broker, 2048 in total, at most 16 per source IP
   (phone side, held for the connection's life);
-- 4096 concurrent control-API connections, at most 96 per source IP;
+- 4096 concurrent control-API connections, at most 96 per source IP; when
+  the relay's TLS session on one ends, the connection is dropped after at
+  most 5 s, even if the client has stopped reading;
 - 10 s for the broker's first bytes, then 5 minutes idle;
 - bytes are not inspected or stored.
 
@@ -224,7 +236,10 @@ renewing.
   hours, so a burst of registrations cannot overshoot the weekly limit.
 - A separate hard limit (default 48) stops first-time issuance with
   `503 issuance_paused`. Renewals (a broker that already has a certificate)
-  are limited only by the per-broker cap. Plan: request a higher limit with Let's Encrypt's rate-limit form,
+  are limited only by the per-broker cap.
+- The relay's own control certificate is in the same log: its first order
+  counts as one new certificate, later orders for the same name are
+  renewals. Plan: request a higher limit with Let's Encrypt's rate-limit form,
 and submit `akdbx.link` to the Public Suffix List (private section) for
 per-user site isolation once the relay serves enough users. The PSL does not
 accept entries whose only purpose is a rate limit.
@@ -271,4 +286,9 @@ accept entries whose only purpose is a rate limit.
   stores a marker; at start-up it removes every marked record and every
   relay-owned `_acme-challenge` record (tagged with the comment
   `akdbx-relay ACME challenge`) older than twice the certificate deadline.
-  Run one relay per DNS zone.
+  A marker whose record is not in the zone yet, and that is younger than
+  twice the certificate deadline, is kept and checked again when that time
+  has passed (the create call that it describes may still land). When the
+  certificate deadline cuts off an order, the relay answers at once and
+  deletes the order's TXT record in the background; the marker stays until
+  the delete succeeds. Run one relay per DNS zone.

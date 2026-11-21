@@ -31,7 +31,7 @@ from .names import (
 from .ratelimit import SlidingWindow, TokenBucket
 from .store import DAY, Broker, Budget, Store
 from .tlspeek import ClientHelloError, read_client_hello
-from .wsconn import ServerWebSocket, WSClosed, abort_writer, close_writer
+from .wsconn import ServerWebSocket, WSClosed, abort_writer, close_writer, flush_and_close
 
 log = logging.getLogger("akdbx_relay")
 
@@ -49,6 +49,8 @@ CONTROL_TLS_HANDSHAKE_TIMEOUT = 10.0
 # After the client side of a control connection ends, how long the relay's
 # own TLS side may take to finish.
 CONTROL_DRAIN_TIMEOUT = 5.0
+# Certificate-log id for the relay's own control certificate (never a broker id).
+CONTROL_CERT_ID = "-control"
 _SECRET_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
 
 
@@ -67,7 +69,8 @@ def rate_key(ip: str) -> str:
 
 class Issuer:  # pragma: no cover - interface description
     async def issue(self, name: str, csr_pem: bytes, deadline: float | None = None) -> str: ...
-    async def cleanup_stale_records(self) -> None: ...
+    async def cleanup_stale_records(self) -> float | None: ...
+    async def recheck_markers(self) -> None: ...
 
 
 class KeyCounter:
@@ -139,7 +142,12 @@ class Relay:
         self.handshakes_by_ip = KeyCounter()
         self.streams_by_ip = KeyCounter()
         self.control_by_ip = KeyCounter()
+        # New public connections per address: names passed through to brokers
+        # (phones) use conn_limiter, the control host name (brokers' control and
+        # stream connections) its own, larger bucket.
         self.conn_limiter = TokenBucket(cfg.conn_rate_per_ip, cfg.conn_burst_per_ip, clock=clock)
+        self.control_conn_limiter = TokenBucket(cfg.control_conn_rate_per_ip, cfg.control_conn_burst_per_ip,
+                                                clock=clock)
         self.reg_limiter = SlidingWindow(cfg.registrations_per_ip_day, DAY, clock=clock)
         self._issuing: set[str] = set()
         self._first_time_in_flight = 0
@@ -156,7 +164,9 @@ class Relay:
 
     async def start(self) -> None:
         if self.issuer is not None:
-            await self.issuer.cleanup_stale_records()
+            recheck = await self.issuer.cleanup_stale_records()
+            if recheck is not None:
+                self._spawn(self._recheck_txt_markers(recheck))
         self.control_tls.load()
         if self.cfg.health_host:
             self._health_server = await asyncio.start_server(
@@ -200,6 +210,15 @@ class Relay:
                 await asyncio.wait_for(server.wait_closed(), 5)
         self._public_server = self._health_server = None
 
+    async def _recheck_txt_markers(self, delay: float) -> None:
+        """Reconcile start-up TXT markers again once their orders cannot still create a record."""
+        assert self.issuer is not None
+        await asyncio.sleep(delay)
+        try:
+            await self.issuer.recheck_markers()
+        except Exception as exc:
+            log.warning("could not recheck ACME TXT markers: %s", type(exc).__name__)
+
     def _spawn(self, coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
@@ -216,9 +235,16 @@ class Relay:
         peer = writer.get_extra_info("peername")
         ip = str(peer[0]) if peer else ""
         key = rate_key(ip)
+        graceful = False
         try:
-            if not self.conn_limiter.allow(key):
-                return
+            # Charge a token before the ClientHello (from the phone bucket, or
+            # the control bucket when that is empty); after SNI routing, move
+            # the charge to the bucket that the name belongs to.
+            charged = self.conn_limiter
+            if not charged.allow(key):
+                charged = self.control_conn_limiter
+                if not charged.allow(key):
+                    return
             if self.pending_handshakes >= self.cfg.max_pending_handshakes:
                 return
             if not self.handshakes_by_ip.acquire(key, self.cfg.max_handshakes_per_ip):
@@ -235,6 +261,11 @@ class Relay:
                 self.handshakes_by_ip.release(key)
             if sni is None:
                 return
+            wanted = self.control_conn_limiter if sni == self.cfg.control_hostname else self.conn_limiter
+            if charged is not wanted:
+                charged.refund(key)
+                if not wanted.allow(key):
+                    return
             if sni == self.cfg.control_hostname:
                 await self._serve_control(reader, writer, hello, ip, key)
                 return
@@ -257,7 +288,7 @@ class Relay:
             if session is None:
                 return
             try:
-                await self._splice(reader, writer, session.ws, hello)
+                graceful = await self._splice(reader, writer, session.ws, hello)
             finally:
                 session.done.set()
         except asyncio.CancelledError:
@@ -265,7 +296,6 @@ class Relay:
         except Exception:
             log.exception("public connection error")
         finally:
-            self._public_writers.discard(writer)
             if reserved_for is not None:
                 self.streams_by_ip.release(key)
                 self.total_streams -= 1
@@ -274,7 +304,15 @@ class Relay:
                     self.streams_per_broker[reserved_for] = left
                 else:
                     self.streams_per_broker.pop(reserved_for, None)
-            await close_writer(writer)
+            try:
+                if graceful:
+                    # The stream ended normally: deliver the last bytes to a
+                    # slow phone while they keep moving. stop() still aborts it.
+                    await flush_and_close(writer, self.cfg.stream_idle_timeout)
+                else:
+                    await close_writer(writer)
+            finally:
+                self._public_writers.discard(writer)
 
     # Control API over TLS on the public port
 
@@ -296,14 +334,16 @@ class Relay:
         if not self.control_by_ip.acquire(key, self.cfg.max_control_connections_per_ip):
             return
         self.control_connections += 1
-        outer, inner = socket.socketpair()
+        outer: socket.socket | None = None
+        inner: socket.socket | None = None
         bridge_writer: asyncio.StreamWriter | None = None
         try:
+            outer, inner = socket.socketpair()
             outer.setblocking(False)
             inner.setblocking(False)
             bridge_reader, bridge_writer = await asyncio.open_connection(sock=outer)
             self._public_writers.add(bridge_writer)
-            self._spawn(self._control_session(inner, ctx, ip))
+            session = self._spawn(self._control_session(inner, ctx, ip))
             inner = None  # owned by the session task now
             bridge_writer.write(hello)
 
@@ -330,10 +370,15 @@ class Relay:
             pumps = {asyncio.create_task(pump(reader, bridge_writer)),
                      asyncio.create_task(pump(bridge_reader, writer))}
             try:
-                _, pending = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+                # The relay's TLS session can end while the client stops
+                # reading; then neither pump finishes on its own.
+                await asyncio.wait(pumps | {session}, return_when=asyncio.FIRST_COMPLETED)
+                pending = {task for task in pumps if not task.done()}
                 if pending:
-                    # One side finished; give the other a moment to finish too.
-                    await asyncio.wait(pending, timeout=CONTROL_DRAIN_TIMEOUT)
+                    # One side finished; give the rest a moment to finish too.
+                    _, pending = await asyncio.wait(pending, timeout=CONTROL_DRAIN_TIMEOUT)
+                if pending:
+                    abort_writer(writer)
             finally:
                 for task in pumps:
                     task.cancel()
@@ -344,7 +389,7 @@ class Relay:
             if bridge_writer is not None:
                 self._public_writers.discard(bridge_writer)
                 await close_writer(bridge_writer)
-            else:
+            elif outer is not None:
                 outer.close()
             self.control_connections -= 1
             self.control_by_ip.release(key)
@@ -406,7 +451,9 @@ class Relay:
         writer: asyncio.StreamWriter,
         ws: ServerWebSocket,
         hello: bytes,
-    ) -> None:
+    ) -> bool:
+        """Splice until one side ends. Returns True for a normal end: the
+        phone closed, or the broker closed the stream with 1000 or 1001."""
         loop = asyncio.get_running_loop()
         started = loop.time()
         last = [started]
@@ -453,8 +500,14 @@ class Relay:
             asyncio.create_task(broker_to_client()),
             asyncio.create_task(idle()),
         ]
+        normal = False
         try:
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            c2b, b2c = tasks[0], tasks[1]
+            if c2b in done and not c2b.cancelled() and c2b.exception() is None:
+                normal = True
+            elif b2c in done and not b2c.cancelled():
+                normal = isinstance(b2c.exception(), WSClosed) and ws.peer_close_code in (1000, 1001)
         finally:
             for task in tasks:
                 task.cancel()
@@ -462,6 +515,7 @@ class Relay:
             del results  # errors here only mean that one side closed
             with contextlib.suppress(Exception):
                 await ws.close(close_code[0])
+        return normal
 
     # Control API routing
 
@@ -623,9 +677,13 @@ class Relay:
     async def _issue_control_certificate(self, name: str, csr_pem: bytes) -> str:
         """The relay's own control certificate, through the same queue and deadline."""
         try:
-            return await self._issue(name, csr_pem)
+            chain = await self._issue(name, csr_pem)
         except HTTPError as exc:
             raise IssuanceError(f"control certificate: {exc.code}") from None
+        # Counted in the certificate log like a broker's: the first one is a
+        # new certificate for the weekly budget, later ones are renewals.
+        self.store.record_certificate(CONTROL_CERT_ID, leaf_not_after(chain).timestamp())
+        return chain
 
     async def api_connect(self, req: Request) -> Response | None:
         broker = self.authenticate(req)

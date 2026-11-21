@@ -49,6 +49,40 @@ async def close_writer(writer: asyncio.StreamWriter, timeout: float = 2.0) -> No
         pass
 
 
+async def flush_and_close(writer: asyncio.StreamWriter, stall_timeout: float, check: float = 1.0) -> None:
+    """Close a stream writer after its buffer flushes, however slowly.
+
+    The wait goes on while the write buffer keeps shrinking; the writer is
+    aborted only when no byte leaves it for `stall_timeout` seconds.
+    """
+    with contextlib.suppress(Exception):
+        writer.close()
+    loop = asyncio.get_running_loop()
+    closed = asyncio.ensure_future(writer.wait_closed())
+    last_size = -1
+    last_progress = loop.time()
+    try:
+        while True:
+            await asyncio.wait({closed}, timeout=check)
+            if closed.done():
+                if not closed.cancelled():
+                    closed.exception()  # retrieved: a reset peer is not an error here
+                return
+            try:
+                size = writer.transport.get_write_buffer_size()
+            except Exception:
+                size = 0
+            now = loop.time()
+            if size != last_size:
+                last_size, last_progress = size, now
+            elif now - last_progress >= stall_timeout:
+                abort_writer(writer)
+                return
+    finally:
+        if not closed.done():
+            closed.cancel()
+
+
 class WSClosed(Exception):
     def __init__(self, code: int | None = None, reason: str = "") -> None:
         super().__init__(f"websocket closed ({code})")
@@ -126,6 +160,12 @@ class ServerWebSocket:
     @property
     def close_code(self) -> int | None:
         return self.protocol.close_code
+
+    @property
+    def peer_close_code(self) -> int | None:
+        """The code in the peer's closing frame, as soon as that frame arrived."""
+        rcvd = self.protocol.close_rcvd
+        return rcvd.code if rcvd is not None else None
 
     async def _flush(self) -> None:
         for data in self.protocol.data_to_send():
