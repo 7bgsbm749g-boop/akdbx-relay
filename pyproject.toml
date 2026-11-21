@@ -7,6 +7,7 @@ name = "akdbx-relay"
 version = "0.1.0"
 description = "Relay that forwards encrypted TLS connections to akdbx brokers without decrypting them"
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
     "websockets>=13.1,<18",

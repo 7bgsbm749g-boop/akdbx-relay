@@ -242,7 +242,8 @@ renewing.
   renewals. Plan: request a higher limit with Let's Encrypt's rate-limit form,
 and submit `akdbx.link` to the Public Suffix List (private section) for
 per-user site isolation once the relay serves enough users. The PSL does not
-accept entries whose only purpose is a rate limit.
+accept entries whose only purpose is a rate limit. The request is deferred; the steps are in
+[PUBLIC-SUFFIX-LIST.md](PUBLIC-SUFFIX-LIST.md).
 
 ## Broker side (akdbx)
 
