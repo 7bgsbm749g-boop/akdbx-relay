@@ -150,6 +150,9 @@ brokers:
    AKDBX_RELAY_PUBLIC_HOSTS=192.0.2.10,2001:db8::10
    AKDBX_RELAY_PUBLIC_PORT=443
    AKDBX_RELAY_PUBLIC_EXTRA_LISTEN=192.0.2.10:8443,192.0.2.20:8443,[2001:db8::10]:8443
+   # Until DNS has moved and the old A record has expired: brokers must not
+   # learn port 443 while their name can still resolve to the old address.
+   AKDBX_RELAY_ADVERTISED_PORT=8443
    ```
 
 3. Update the unit and restart: `sudo deploy/setup.sh --start`. Check the new
@@ -159,9 +162,11 @@ brokers:
 4. Point the `*.akdbx.link` A record to the new address. Check
    `curl -s https://relay.akdbx.link/api/v1/health` and
    `curl -s https://relay.akdbx.link:8443/api/v1/health`.
-5. Brokers (akdbx 0.28.0 and later) call `GET /api/v1/broker` at their next
-   start and move to `https://<id>.akdbx.link` without registering again.
-   Older brokers keep using port 8443 until they update.
+5. Wait at least the old A record's TTL. Then remove
+   `AKDBX_RELAY_ADVERTISED_PORT` and restart: the relay now advertises
+   port 443. Brokers (akdbx 0.28.0 and later) call `GET /api/v1/broker` at
+   their next start and move to `https://<id>.akdbx.link` without
+   registering again. Older brokers keep using port 8443 until they update.
 6. Remove the old-address listener only after the old A record has expired
    from caches (wait at least its TTL). When port 8443 is no longer needed,
    remove `AKDBX_RELAY_PUBLIC_EXTRA_LISTEN`, restart, and close `8443/tcp`.
