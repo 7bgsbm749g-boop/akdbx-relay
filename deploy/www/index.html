@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>akdbx relay</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fbfbfd; --muted: #5f6368; --accent: #2457c5; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #ececf1; --bg: #15161a; --muted: #a0a4ad; --accent: #8fb0ff; } }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 40rem; margin: 0 auto; padding: 3rem 1rem; }
+  h1 { font-size: 1.6rem; margin: 0 0 .5rem; }
+  p, li { color: var(--fg); }
+  .muted { color: var(--muted); }
+  a { color: var(--accent); }
+  code { font-size: .92em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>akdbx relay</h1>
+  <p class="muted">Encrypted pass-through for akdbx brokers.</p>
+  <p>This relay lets you open your akdbx broker's private pages from another
+  device without an open port or a VPN. It forwards <strong>encrypted</strong>
+  TLS connections only. Each broker keeps its own certificate key, so the relay
+  cannot read your master password or any other value.</p>
+  <p>Addresses such as <code>https://&lt;id&gt;.akdbx.link:8443</code> belong to
+  individual brokers. There is nothing to sign up for here: run
+  <code>akdbx relay enable</code> on your broker.</p>
+  <p>More secure options exist: a private proxy such as Tailscale Serve keeps
+  the page reachable only from your own devices.</p>
+  <p><a href="https://github.com/7bgsbm749g-boop/akdbx-relay">Source code and security model</a></p>
+</main>
+</body>
+</html>
