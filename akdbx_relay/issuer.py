@@ -11,7 +11,6 @@ import asyncio
 import datetime
 import logging
 import os
-import threading
 
 import josepy as jose
 from acme import challenges, client, errors, messages
@@ -81,7 +80,6 @@ class ACMEIssuer:
         self.dns = dns
         self._key: jose.JWKRSA | None = None
         self._account_lock = asyncio.Lock()
-        self._thread_lock = threading.Lock()
 
     @property
     def _meta_key(self) -> str:
@@ -144,6 +142,8 @@ class ACMEIssuer:
         except IssuanceError:
             raise
         except messages.Error as exc:
+            if exc.code == "accountDoesNotExist":
+                self.store.set_meta(self._meta_key, "")
             if exc.code == "rateLimited":
                 raise IssuanceRateLimited(_retry_after_from_error(exc)) from None
             raise IssuanceError(f"ACME error {exc.code or exc.typ}") from None
