@@ -50,7 +50,7 @@ phone --TLS (SNI = <id>.akdbx.link)--> relay :8443 --WebSocket--> broker --> 127
   for a broker's name and intercept connections. Every publicly trusted
   certificate appears in Certificate Transparency logs, so this cannot stay
   hidden: a broker can check the logs for certificates it did not request
-  (akdbx reports them in `akdbx relay status`). Use a private proxy (option
+  (the akdbx broker can report them in `akdbx relay status`). Use a private proxy (option
   2 above) if this trust point is not acceptable.
 - **Names cannot be chosen.** Names are 12 random characters from
   `[a-z2-7]`, so nobody can register a look-alike such as `paypal.akdbx.link`.

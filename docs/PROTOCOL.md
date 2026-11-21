@@ -49,18 +49,28 @@ TLS terminates only in the broker, with the broker's own key.
 
 All JSON bodies are UTF-8. All control endpoints are HTTPS through Cloudflare.
 
+Every error response has a JSON body `{"error": "<code>", "message": "..."}`.
+When waiting can help (`429` and `503`), the body also has `"retry_after":
+<integer seconds>` and the response has the same value in a `Retry-After`
+header. Clients must accept unknown JSON fields.
+
+### Health: `GET /api/v1/health`
+
+Response 200: `{"status": "ok", "protocol": 1, "version": "<relay version>",
+"registrations": "open" | "paused"}`. No authentication.
+
 ### Register: `POST /api/v1/register`
 
-Request: `{"protocol": 1, "client": "akdbx/<version>"}`.
+Request: `{"protocol": 1, "client": "akdbx/<version>"}`. `client` is optional
+(at most 64 printable characters).
 
 Response 201: `{"protocol": 1, "name": "<id>.akdbx.link", "broker_id": "<id>",
 "secret": "<43-char base64url>", "public_port": 8443}`.
 
 - `secret` is a bearer credential. The relay stores only its SHA-256.
-- Errors (JSON `{"error": "<code>", "message": "..."}`): 429
-  `rate_limited` (per source IP, for example 5 registrations per day);
-  503 `registrations_paused` (certificate budget used up, see below);
-  400 `unsupported_protocol`.
+- Errors: 429 `rate_limited` (per source IP, default 5 registrations per
+  day; IPv6 addresses count per /64); 503 `registrations_paused` (certificate
+  budget used up, see below); 400 `unsupported_protocol`; 400 `bad_request`.
 
 ### Certificate: `POST /api/v1/certificate`
 
@@ -73,8 +83,15 @@ Header `Authorization: Bearer <secret>`. Body: `{"csr": "<PEM CSR>"}`.
 - Response 200: `{"certificate": "<PEM chain, leaf first>", "not_after": "<RFC3339>"}`.
 - A broker renews when less than one third of the lifetime remains. It may
   reuse or rotate its key.
-- Errors: 401 `unauthorized`; 400 `bad_csr`; 503 `issuance_paused`;
-  502 `acme_failed`.
+- `not_after` is UTC in the form `YYYY-MM-DDTHH:MM:SSZ`.
+- Errors: 401 `unauthorized`; 400 `bad_csr`; 429 `rate_limited` (more than
+  5 certificates for this broker in 7 days, or a request for this broker is
+  still running); 503 `issuance_paused` (relay budget or the certificate
+  authority's rate limit reached, issuance not configured, or the relay is
+  busy); 502 `acme_failed`. Failed orders do not count against any limit.
+- The CSR subject may be empty or hold only a common name equal to the
+  broker's name. Allowed extensions: subjectAltName, keyUsage,
+  extendedKeyUsage, basicConstraints (not a CA).
 
 ### Control channel: `GET /api/v1/connect` (WebSocket)
 
@@ -86,12 +103,32 @@ Relay to broker text frames: `{"type": "open", "stream": "<32-hex id>"}` and
 every 30 s and closes a control connection that does not answer in 60 s. The
 broker reconnects with backoff (1 s doubling to 60 s, with jitter).
 
+- The broker may also send `{"type": "ping"}`; the relay answers
+  `{"type": "pong"}`. Both sides ignore unknown message types.
+- Messages are at most 4 KiB. Binary frames on the control channel are a
+  protocol error.
+- Close codes from the relay: 4000 (replaced by a newer control connection),
+  4001 (no pong in time), 1003 (binary frame), 1007 (invalid JSON),
+  1001 (relay shutting down).
+- Errors before the upgrade: 401 `unauthorized`; 400 `websocket_required`.
+
 ### Stream: `GET /api/v1/stream/<stream>` (WebSocket)
 
 Header `Authorization: Bearer <secret>`. The stream id must have been announced
 to this broker in the last 10 s and is single-use. After the upgrade, binary
 frames carry raw bytes in both directions. Either side closes to end the
 stream. Text frames on a stream are a protocol error.
+
+- The first binary frame from the relay is the buffered ClientHello, byte for
+  byte.
+- Binary messages are at most 1 MiB.
+- The relay also sends WebSocket ping frames every 30 s so that proxies keep
+  idle streams open; standard WebSocket clients answer them automatically.
+- Errors before the upgrade: 401 `unauthorized`; 404 `unknown_stream`
+  (unknown, expired, already used, or announced to another broker);
+  400 `websocket_required`.
+- Close codes from the relay: 1000 (the phone closed, or the stream was idle),
+  1003 (text frame), 1011 (the phone connection was already gone).
 
 ### Public listener (:8443, raw TCP)
 
@@ -114,7 +151,13 @@ week; renewals of the same name are exempt. The relay counts new
 (first-time) certificates in a rolling 7-day window. When the count reaches a
 configured budget (default 40), it answers new registrations with
 `503 registrations_paused` and a `retry_after` time. Existing brokers keep
-renewing. Plan: request a higher limit with Let's Encrypt's rate-limit form,
+renewing.
+
+- A registration that has no certificate yet holds one budget slot for 24
+  hours, so a burst of registrations cannot overshoot the weekly limit.
+- A separate hard limit (default 48) stops first-time issuance with
+  `503 issuance_paused`. Renewals (a broker that already has a certificate)
+  are limited only by the per-broker cap. Plan: request a higher limit with Let's Encrypt's rate-limit form,
 and submit `akdbx.link` to the Public Suffix List (private section) for
 per-user site isolation once the relay serves enough users. The PSL does not
 accept entries whose only purpose is a rate limit.
@@ -145,6 +188,7 @@ accept entries whose only purpose is a rate limit.
   systemd unit. Public listener `0.0.0.0:8443` and `[::]:8443`; control API on
   `127.0.0.1:<port>` behind Caddy (`akdbx.link` site, proxied by Cloudflare).
 - The firewall opens 8443/tcp to everyone. Ports 80/443 stay Cloudflare-only.
-- Secrets: Cloudflare API token limited to DNS edit on the `akdbx.link` zone,
-  ACME account key. Both in a 0600 environment file, never in Git.
+- Secrets: Cloudflare API token limited to DNS edit on the `akdbx.link` zone
+  (in a 0600 environment file), and the ACME account key (a 0600 PEM file in
+  the relay's 0700 state directory). Neither is in Git.
 - State: SQLite (brokers, secret hashes, issued-certificate log).
