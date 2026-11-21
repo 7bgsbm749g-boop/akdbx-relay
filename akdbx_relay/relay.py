@@ -477,8 +477,6 @@ class Relay:
         stream_id = req.path[len("/api/v1/stream/"):]
         if not is_valid_stream_id(stream_id):
             raise HTTPError(404, "unknown_stream")
-        if not req.is_websocket:
-            raise HTTPError(400, "websocket_required", "this endpoint needs a WebSocket upgrade")
         pending = self.pending.get(stream_id)
         if (
             pending is None
@@ -487,6 +485,8 @@ class Relay:
             or self.clock() - pending.created > self.cfg.stream_open_timeout
         ):
             raise HTTPError(404, "unknown_stream")
+        if not req.is_websocket:
+            raise HTTPError(400, "websocket_required", "this endpoint needs a WebSocket upgrade")
         del self.pending[stream_id]  # single use
         ws = await ServerWebSocket.accept(req.reader, req.writer, req.raw_head, STREAM_MAX_MESSAGE)
         if ws is None:

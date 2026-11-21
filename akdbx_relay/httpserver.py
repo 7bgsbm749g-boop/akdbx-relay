@@ -212,7 +212,7 @@ class HTTPServer:
                     raise HTTPError(404, "not_found")
                 handler, max_body = route
                 body = b""
-                if method == "POST":
+                if method == "POST" and max_body > 0:
                     body = await asyncio.wait_for(_read_body(reader, headers, max_body), BODY_TIMEOUT)
                 request = Request(method, path, query, headers, raw_head, peer, reader, writer, body)
                 response = await handler(request)
